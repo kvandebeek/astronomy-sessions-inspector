@@ -72,12 +72,30 @@ def exposure_folder(exptime):
     return f"EXP_{float(exptime):.2f}"
 
 
+def exposure_seconds(header):
+    """EXPTIME (or EXPOSURE) as a float, or None when it is missing or not a number.
+
+    Checked once here: a non-numeric card used to get as far as exposure_folder() or
+    describe_set() and abort the whole run, dry run included, with a traceback.
+    """
+    value = header.get("EXPTIME", header.get("EXPOSURE"))
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def settings_folder(header):
     gain = header.get("GAIN")
     xb, yb = header.get("XBINNING"), header.get("YBINNING")
     if gain is None or xb is None:
         return None
-    return f"GAIN{int(round(float(gain)))}_BIN{int(xb)}x{int(yb or xb)}"
+    try:
+        return f"GAIN{int(round(float(gain)))}_BIN{int(xb)}x{int(yb or xb)}"
+    except (TypeError, ValueError):
+        return None     # a card that is not a number: file without the settings level
 
 
 def scan_session(session: Path):
@@ -116,7 +134,7 @@ def scan_session(session: Path):
                 continue
             flats.append({"path": path, "rel": rel + (name,),
                           "filter": str(header.get("FILTER", "")).strip(),
-                          "exptime": header.get("EXPTIME", header.get("EXPOSURE")),
+                          "exptime": exposure_seconds(header),
                           "settings": settings_folder(header)})
     return flats, light_filters, problems
 
@@ -134,7 +152,7 @@ def plan_session(session: Path, flats):
             problems.append(f"no FILTER in header, left in place: {f['path']}")
             continue
         if f["exptime"] is None:
-            problems.append(f"no EXPTIME in header, left in place: {f['path']}")
+            problems.append(f"no usable EXPTIME in header, left in place: {f['path']}")
             continue
         dst = session / group / f["filter"] / FLAT_DIR_NAME
         if f["settings"]:

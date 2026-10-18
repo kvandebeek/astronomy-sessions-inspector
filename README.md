@@ -40,7 +40,7 @@ Also supports `--solve` (plate solve via ASTAP, recording pointing error),
 `--write-wcs`, and `--save-calibrated [dir]` to dump calibrated float32 FITS
 alongside the originals.
 
-Requires: `numpy`, `astropy`, `photutils`.
+Requires: `numpy`, `astropy`, `photutils`, `scipy`, `scikit-image`.
 
 ### `fits_review_server.py`
 Serves the same per-folder tables as a local, interactive web UI
@@ -49,7 +49,7 @@ live-rendered preview (linear or auto-stretch); you can delete a frame
 straight from there. Deleting moves the file into a `_deleted/` folder next
 to the report (mirroring its relative path) instead of erasing it, so it's
 recoverable. Only binds to localhost and only ever touches files that were
-part of the scanned dataset.
+part of the scanned dataset. Additionally requires `pillow`.
 
 ```
 python3 fits_review_server.py -j fits_light_data.json -r . -p 8765
@@ -82,7 +82,7 @@ exists yet (or always, with `--rescan`).
 ```
 python3 -m venv .venv
 source .venv/bin/activate
-pip install numpy astropy photutils
+pip install numpy astropy photutils scipy scikit-image pillow
 ```
 
 (`run_light_stats.sh`/`run_review_server.sh` expect this venv one directory

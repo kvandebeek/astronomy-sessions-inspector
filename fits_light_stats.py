@@ -10,7 +10,8 @@ an HTML report with one table per LIGHT folder.
 Usage:
     python3 fits_light_stats.py [root_dir] [-o output.html] [-j cache.json] [-w workers]
 
-Requires: numpy, astropy, photutils  (pip install numpy astropy photutils)
+Requires: numpy, astropy, photutils, scipy, scikit-image
+    (pip install numpy astropy photutils scipy scikit-image)
 """
 import argparse
 import hashlib
@@ -475,7 +476,9 @@ def scan_flat_dirs(root: Path):
         session = session_dir_of(directory / "x", FLAT_DIR_NAME)
         if session is None:
             continue
-        key = (str(session), parts[i - 1])
+        # Upper-cased, as organize_flats.py compares them: a "Ha" folder and an "HA" FILTER
+        # card are one filter, and the lookup in calibration_for() folds case the same way.
+        key = (str(session), parts[i - 1].upper())
         files = [directory / n for n in filenames if Path(n).suffix.lower() in FITS_EXTS]
         if files:
             found.setdefault(key, []).extend(files)
@@ -529,11 +532,19 @@ def prepare_calibration(root: Path, darks_dir, progress=True, calibrated_dir=Non
     naming .npy files the workers memory-map. None if there is nothing to calibrate with.
     """
     darks_dir = Path(darks_dir).expanduser().resolve() if darks_dir else None
+    if darks_dir is not None and not darks_dir.is_dir():
+        # A mistyped --darks used to glob an empty list and carry on, so the whole scan ran
+        # bias-free with nothing on the terminal to say why.
+        print(f"calibration: WARNING - darks folder {darks_dir} does not exist; "
+              f"no master bias or darks will be applied", file=sys.stderr)
+        darks_dir = None
     flat_sets = scan_flat_dirs(root)
-    if darks_dir is None and not flat_sets:
+    cache = root / CALIB_DIRNAME
+    # Without --darks the cache's own bias/darks from an earlier run are reused below, so
+    # only give up when there is neither anything new to build nor anything cached.
+    if darks_dir is None and not flat_sets and not any(cache.glob("*.npy")):
         return None
 
-    cache = root / CALIB_DIRNAME
     cache.mkdir(exist_ok=True)
     manifest = {"root": str(root), "bias": None, "darks": {}, "flats": {},
                 "calibrated_dir": str(calibrated_dir) if calibrated_dir else None}
@@ -566,7 +577,12 @@ def prepare_calibration(root: Path, darks_dir, progress=True, calibrated_dir=Non
                 if progress and label:
                     print(" - skipped", file=sys.stderr)
                 return None
-            np.save(out, np.ascontiguousarray(arr, dtype=np.float32))
+            # Via a temp name: a master is reused purely because its file exists, so one
+            # cut short by Ctrl+C or a full disk would otherwise be loaded on every later run.
+            # The temp name keeps the .npy suffix, or np.save would append a second one.
+            tmp = out.with_name(out.stem + ".part.npy")
+            np.save(tmp, np.ascontiguousarray(arr, dtype=np.float32))
+            os.replace(tmp, out)
             built[0] += 1
             if progress and label:
                 print(f" - {time.time() - t0:.1f}s", file=sys.stderr)
@@ -599,11 +615,16 @@ def prepare_calibration(root: Path, darks_dir, progress=True, calibrated_dir=Non
     else:
         # No raw XISF masters given: reuse whatever bias/dark .npy the cache already
         # holds from a previous run, instead of silently calibrating with neither.
-        bias_candidates = sorted(cache.glob("bias-*.npy"))
+        # Oldest first, so the newest master wins. The names end in a content hash, so
+        # sorting by name picked an arbitrary one once a master had been rebuilt.
+        def by_age(pattern):
+            return sorted(cache.glob(pattern), key=lambda q: q.stat().st_mtime)
+
+        bias_candidates = by_age("bias-*.npy")
         if bias_candidates:
             manifest["bias"] = str(bias_candidates[-1])
             bias = np.load(manifest["bias"], mmap_mode="r")
-        for dark_path in sorted(cache.glob("dark_*s-*.npy")):
+        for dark_path in by_age("dark_*s-*.npy"):
             m = re.search(r"dark_([0-9.]+)s-", dark_path.name)
             if m:
                 manifest["darks"][float(m.group(1))] = str(dark_path)
@@ -697,7 +718,7 @@ def calibration_for(manifest, path: Path, exposure, filt):
 
     flat = None
     session = session_dir_of(path, LIGHT_DIR_NAME)
-    flat_path = manifest["flats"].get((str(session) if session else "", (filt or "").strip()))
+    flat_path = manifest["flats"].get((str(session) if session else "", (filt or "").strip().upper()))
     if flat_path:
         flat = master(flat_path)
         parts.append("flat")
@@ -1708,8 +1729,11 @@ def filter_tint_css(filt):
 
 
 def natural_num(s):
-    m = re.search(r"(\d+)", s)
-    return int(m.group(1)) if m else 0
+    """Natural sort key: "Panel 2" before "Panel 10", and names that share a leading number
+    ("2024-10-03", "2024-11-12") or carry none at all still order by the rest of the name
+    rather than tying and falling back to whatever order they were collected in."""
+    return [(0, int(chunk), "") if chunk.isdigit() else (1, 0, chunk.lower())
+            for chunk in re.findall(r"\d+|\D+", s)]
 
 
 def filter_sort_key(f):
@@ -2320,11 +2344,16 @@ SORT_TABLE_JS = """
   // frame sort as strings, putting "11.40" above "2.05" in HFR, ADU, quality and the
   // rest. Blank cells were already treated this way; the dash just never was.
   var MISSING = /^[\\s\\u2013\\u2014-]*$/;
+  // The whole cell has to read as a number ("1,234.5", "+12.3", "85.0%"). Stripping every
+  // non-digit and parsing what was left turned a filename like "Light_M31_30.00s_0001.fits"
+  // into 30, so the File column sorted as numbers that were all the same.
+  var NUMBER = /^[+\\-\\u2212]?[\\d.,]*\\d\\s*%?$/;
 
   function cellSortValue(td) {
     var raw = td.textContent.trim();
     if (MISSING.test(raw)) return { raw: raw, num: null, missing: true };
-    var num = parseFloat(raw.replace(/[^0-9.\\-]+/g, ''));
+    if (!NUMBER.test(raw)) return { raw: raw, num: null, missing: false };
+    var num = parseFloat(raw.replace(/\\u2212/, '-').replace(/[^0-9.\\-]+/g, ''));
     return { raw: raw, num: isNaN(num) ? null : num, missing: false };
   }
 
@@ -2358,11 +2387,15 @@ SORT_TABLE_JS = """
     dataRows.sort(function (a, b) {
       var av = cellSortValue(a.cells[idx]);
       var bv = cellSortValue(b.cells[idx]);
+      // Missing values go last in either direction. As -Infinity they compared NaN against
+      // each other (-Infinity - -Infinity), which leaves the sort order undefined.
+      if (av.missing || bv.missing) return av.missing === bv.missing ? 0 : (av.missing ? 1 : -1);
       var cmp;
       if (numeric) {
-        cmp = (av.num === null ? -Infinity : av.num) - (bv.num === null ? -Infinity : bv.num);
+        cmp = av.num - bv.num;
       } else {
-        cmp = av.raw.localeCompare(bv.raw);
+        // numeric collation: "session 2" before "session 10", "_0002" before "_0010".
+        cmp = av.raw.localeCompare(bv.raw, undefined, { numeric: true, sensitivity: 'base' });
       }
       return asc ? cmp : -cmp;
     });
@@ -2447,6 +2480,14 @@ def main():
     cache = Path(args.json_cache) if args.json_cache else None
 
     if cache and cache.exists() and not args.rescan:
+        print(f"Using cached measurements from {cache} (pass --rescan to re-measure)",
+              file=sys.stderr)
+        if args.solve or args.write_wcs or args.save_calibrated:
+            # These only act while frames are being measured; quietly dropping them left
+            # e.g. --solve looking like it ran and simply found nothing. (--darks is left
+            # out: run_light_stats.sh always passes it.)
+            print("  note: --solve/--write-wcs/--save-calibrated have no effect without "
+                  "--rescan", file=sys.stderr)
         dataset = add_dataset_derived_fields(json.loads(cache.read_text(encoding="utf-8")))
     else:
         calibrated_dir = None

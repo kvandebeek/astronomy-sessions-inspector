@@ -2493,9 +2493,12 @@ def build_page(ds: Dataset) -> str:
     def grid_button(panel, filt, exposure, stop_propagation):
         """A matrix row is now exactly one thumbnail group, so it needs exactly one button."""
         stop = "event.stopPropagation(); " if stop_propagation else ""
+        # JSON-encode for the JS string, then HTML-escape for the attribute. HTML-escaping
+        # alone is undone by the parser before the script runs, so a folder named
+        # "Bode's Galaxy" closed the quoted argument early and the button did nothing.
+        args = ", ".join(json.dumps(v) for v in (panel, filt, exposure))
         return (f'<button class="btn grid-btn" onclick="{stop}openGroupGrid('
-                f'\'{html.escape(panel, quote=True)}\', \'{html.escape(filt, quote=True)}\', '
-                f'\'{html.escape(exposure, quote=True)}\')">All thumbnails</button>')
+                f'{html.escape(args, quote=True)})">All thumbnails</button>')
 
     def row_extra(panel, filt, exposure):
         return (grid_button(panel, filt, exposure, stop_propagation=True)
@@ -2557,7 +2560,7 @@ def build_page(ds: Dataset) -> str:
     <div class="modal-actions">
       <button class="btn" id="linear-btn" onclick="setStretch('linear')">Linear</button>
       <button class="btn" id="auto-btn" onclick="setStretch('auto')">Auto stretch</button>
-      <button class="btn" id="super-btn" onclick="setStretch('super')" title="Auto stretch, turned up: a tighter window and a harder asinh knee">Super stretch</button>
+      <button class="btn" id="super-btn" onclick="setStretch('super')" title="Auto stretch, turned up: the sky background lifted to a brighter grey">Super stretch</button>
       <button class="btn" id="raw-btn" onclick="setSource('raw')" title="Show the frame as the camera recorded it" hidden>Raw</button>
       <button class="btn" id="calibrated-btn" onclick="setSource('calibrated')" title="Show the dark-subtracted, flat-divided frame the metrics were measured on" hidden>Calibrated</button>
       <button class="btn" id="zoom-btn" onclick="toggleZoom()" title="Inspect star shapes at 1:1 - click the preview to zoom there, drag to pan">100%</button>
@@ -2583,7 +2586,7 @@ def build_page(ds: Dataset) -> str:
       <button class="btn" id="grid-calibrated-btn" onclick="setSource('calibrated')" title="Show the calibrated frames" hidden>Calibrated</button>
       <button class="btn" id="grid-linear-btn" onclick="setGroupStretch('linear')">Linear</button>
       <button class="btn" id="grid-auto-btn" onclick="setGroupStretch('auto')">Auto stretch</button>
-      <button class="btn" id="grid-super-btn" onclick="setGroupStretch('super')" title="Auto stretch, turned up: a tighter window and a harder asinh knee">Super stretch</button>
+      <button class="btn" id="grid-super-btn" onclick="setGroupStretch('super')" title="Auto stretch, turned up: the sky background lifted to a brighter grey">Super stretch</button>
       <button class="btn" onclick="closeGroupGrid()">Close</button>
     </div>
     <div id="grid-wrap"></div>
