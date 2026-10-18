@@ -39,7 +39,7 @@ from skimage.transform import hough_line
 
 FITS_EXTS = {".fit", ".fits", ".fts"}
 EXCLUDED_DIR_NAMES = {"_deleted", ".calibration", "calibrated"}
-BIAS_ADU = 2796.0        # measured average bias pedestal, subtracted for signal estimates
+BIAS_ADU = 2796.0        # fallback bias pedestal for signal estimates when no master bias is known
 SATURATION_ADU = 60000    # peak ADU above which a star is considered saturated and skipped
 FWHM_GUESS_PX = 4.0       # matched-filter kernel FWHM used for source detection
 DETECT_SIGMA = 5.0        # detection threshold = DETECT_SIGMA * background sigma
@@ -118,6 +118,10 @@ QUALITY_RELATIVE = {
 QUALITY_RELATIVE_MIN_SET = 5
 QUALITY_WARN_MAX = 70    # score < this -> "warn"
 QUALITY_REJECT_MAX = 40  # score < this -> "reject"
+# A trail is one line through an otherwise fine frame, and a stacker's pixel rejection
+# usually removes it - so it costs a fixed amount rather than sinking the frame. It does
+# cap the verdict at "warn", though: green in the review grid should mean nothing to look at.
+QUALITY_TRAIL_PENALTY = 15
 
 
 def _ramp_penalty(value, good, bad, max_penalty):
@@ -192,6 +196,7 @@ def compute_quality(r):
             reasons.append(describe(value))
 
     if trail:
+        score -= QUALITY_TRAIL_PENALTY
         reasons.insert(0, "satellite trail")
 
     if stars == 0 or (hfr is None and fwhm is None and stars is None):
@@ -200,6 +205,8 @@ def compute_quality(r):
 
     score = max(0.0, min(100.0, score))
     verdict = "reject" if score < QUALITY_REJECT_MAX else "warn" if score < QUALITY_WARN_MAX else "good"
+    if trail and verdict == "good":
+        verdict = "warn"
     return score, reasons, verdict
 
 _HOUGH_NORM_CACHE = {}   # (pooled shape, n_theta) -> per-bin pixel counts, built once
@@ -546,7 +553,7 @@ def prepare_calibration(root: Path, darks_dir, progress=True, calibrated_dir=Non
         return None
 
     cache.mkdir(exist_ok=True)
-    manifest = {"root": str(root), "bias": None, "darks": {}, "flats": {},
+    manifest = {"root": str(root), "bias": None, "bias_level": None, "darks": {}, "flats": {},
                 "calibrated_dir": str(calibrated_dir) if calibrated_dir else None}
 
     built = [0]
@@ -603,6 +610,7 @@ def prepare_calibration(root: Path, darks_dir, progress=True, calibrated_dir=Non
                                          lambda c=candidate: read_xisf(c), label)
                 if manifest["bias"]:
                     bias = np.load(manifest["bias"], mmap_mode="r")
+                    manifest["bias_level"] = bias_level(bias)
                 continue
             exposure = float(m.group(1))
             path = store(f"dark_{exposure:g}s-{stamp}.npy",
@@ -624,6 +632,7 @@ def prepare_calibration(root: Path, darks_dir, progress=True, calibrated_dir=Non
         if bias_candidates:
             manifest["bias"] = str(bias_candidates[-1])
             bias = np.load(manifest["bias"], mmap_mode="r")
+            manifest["bias_level"] = bias_level(bias)
         for dark_path in by_age("dark_*s-*.npy"):
             m = re.search(r"dark_([0-9.]+)s-", dark_path.name)
             if m:
@@ -641,19 +650,77 @@ def prepare_calibration(root: Path, darks_dir, progress=True, calibrated_dir=Non
         print(f"calibration: {len(flat_sets)} master flats to prepare "
               f"(one per session and filter)", file=sys.stderr)
     for n, ((session, filt), files) in enumerate(flat_sets.items(), 1):
-        tag = re.sub(r"[^A-Za-z0-9]+", "_", Path(session).name)
+        # The readable part alone is lossy ("night 1" and "night_1" both become night_1),
+        # so a hash of the full session path and filter keeps every set's name its own.
+        ident = hashlib.sha1(f"{session}|{filt}".encode()).hexdigest()[:6]
+        tag = "_".join(re.sub(r"[^A-Za-z0-9]+", "_", part)
+                       for part in (Path(session).name, filt)) + "_" + ident
         label = f"[{n}/{len(flat_sets)}] flat {Path(session).name} / {filt} ({len(files)} frames)"
-        path = store(f"flat_{tag}_{filt}-{fingerprint(files)}.npy",
+        path = store(f"flat_{tag}-{fingerprint(files)}.npy",
                      lambda f=files: _build_master_flat(f, bias), label)
         if path:
             manifest["flats"][(session, filt)] = path
     used = [manifest["bias"]] + list(manifest["darks"].values()) + list(manifest["flats"].values())
     manifest["masters_mtime"] = max(
         (Path(q).stat().st_mtime for q in used if q), default=0.0)
+    prune_calibration_cache(cache, used, progress)
     if progress:
         print(f"calibration: {len(manifest['darks'])} darks + {len(manifest['flats'])} flats "
               f"ready ({built[0]} built, rest reused) in {cache}", file=sys.stderr)
     return manifest
+
+
+def bias_level(bias):
+    """The master bias' pedestal in ADU, for estimating sky signal where no dark or bias
+    could be subtracted. A strided median: the pedestal is flat to a fraction of an ADU."""
+    return float(np.median(np.asarray(bias[::4, ::4], dtype=np.float32)))
+
+
+def master_bias_level(darks_dir):
+    """bias_level() straight from the masterBias XISF, for runs that do not calibrate."""
+    darks_dir = Path(darks_dir).expanduser() if darks_dir else None
+    if darks_dir is None or not darks_dir.is_dir():
+        return None
+    for candidate in sorted(darks_dir.glob("masterBias*.xisf"))[:1]:
+        try:
+            offset, shape, dtype, scale = _xisf_image_spec(candidate)
+            data = np.memmap(candidate, dtype=dtype, mode="r", offset=offset, shape=shape)
+            return bias_level(data) * scale
+        except (OSError, ValueError) as e:
+            print(f"calibration: cannot read {candidate.name} for the bias level ({e})",
+                  file=sys.stderr)
+    return None
+
+
+# Everything prepare_calibration() writes. Only these are ever pruned from the cache.
+_CACHE_FILE_PATTERNS = ("bias-*.npy", "dark_*s-*.npy", "flat_*-*.npy", "*.part.npy")
+
+
+def prune_calibration_cache(cache: Path, used, progress=True):
+    """Delete cached masters this run did not use.
+
+    Every rebuilt master flat gets a new name (its inputs' fingerprint is part of it), so
+    without this the old one stayed behind forever - ~36 MB per full-size frame, per
+    session and filter, per rescan after new flats. Anything removed is rebuilt from the
+    source frames if it is ever needed again. Only files matching the names this module
+    writes are touched.
+    """
+    keep = {Path(q).resolve() for q in used if q}
+    freed, removed = 0, 0
+    for pattern in _CACHE_FILE_PATTERNS:
+        for stale in cache.glob(pattern):
+            if stale.resolve() in keep:
+                continue
+            try:
+                size = stale.stat().st_size
+                stale.unlink()
+            except OSError:
+                continue
+            freed += size
+            removed += 1
+    if progress and removed:
+        print(f"calibration: removed {removed} unused cached master(s), "
+              f"{freed / 1e6:.0f} MB freed", file=sys.stderr)
 
 
 def write_calibrated(manifest, path: Path, data, header, calibration):
@@ -1409,7 +1476,9 @@ def detect_star_metrics(flat, noise, h, w, saturated_idx=None):
     return hfr.tolist(), fwhm_final.tolist(), roundness_final.tolist(), trail, elong
 
 
-def process_file(path: Path, calib=None, solver=None):
+def process_file(path: Path, calib=None, solver=None, pedestal=None):
+    """Measure one frame. `pedestal` is the bias level in ADU to take the sky signal
+    against when no dark or bias ends up subtracted (BIAS_ADU if not given)."""
     # One open for both header and data: getdata()+getheader() parsed the file twice.
     with fits.open(str(path), memmap=False) as hdul:
         hdu = first_image_hdu(hdul)
@@ -1463,7 +1532,7 @@ def process_file(path: Path, calib=None, solver=None):
         # estimate made by subtracting a nominal bias.
         signal_adu = float(data.mean(dtype=np.float64))
     else:
-        signal_adu = adu_mean - BIAS_ADU
+        signal_adu = adu_mean - (pedestal if pedestal is not None else BIAS_ADU)
     signal_adu_per_sec = (
         signal_adu / exposure
         if isinstance(exposure, (int, float)) and exposure > 0
@@ -1491,17 +1560,16 @@ def process_file(path: Path, calib=None, solver=None):
         "exposure": exposure,
         "calibration": calibration,
         "calibrated_path": calibrated_path,
-        "solved_ra": solved["ra"] if solved else None,
-        "solved_dec": solved["dec"] if solved else None,
-        "solved_rotation": solved.get("rotation") if solved else None,
-        "solved_scale_arcsec": solved.get("scale_arcsec") if solved else None,
-        "pointing_error_arcsec": solved.get("error_arcsec") if solved else None,
+        **solved_fields(solved),
         "date_obs": str(header.get("DATE-LOC", header.get("DATE-OBS", ""))).strip(),
         "adu_min": adu_min,
         "adu_max": adu_max,
         "adu_mean": adu_mean,
         "signal_adu": signal_adu,
         "signal_adu_per_sec": signal_adu_per_sec,
+        # What signal_adu was measured against when nothing was subtracted, so a backfill
+        # of an older row never mixes pedestals within one set.
+        "pedestal_adu": None if dark_ok else (pedestal if pedestal is not None else BIAS_ADU),
         "num_stars": len(hfrs),
         "hfr_avg": float(np.median(hfrs)) if hfrs else None,
         "fwhm_avg": float(np.median(fwhms)) if fwhms else None,
@@ -1520,10 +1588,72 @@ def process_file(path: Path, calib=None, solver=None):
     return row
 
 
-def process_file_safe(path: Path, calib=None, solver=None):
+def solved_fields(solved):
+    """The row fields a plate solve fills in, all None when it did not solve."""
+    solved = solved or {}
+    return {"solved_ra": solved.get("ra"), "solved_dec": solved.get("dec"),
+            "solved_rotation": solved.get("rotation"),
+            "solved_scale_arcsec": solved.get("scale_arcsec"),
+            "pointing_error_arcsec": solved.get("error_arcsec")}
+
+
+def first_image_header(path: Path):
+    """Header of the first image HDU, without reading any pixel data."""
+    with fits.open(str(path)) as hdul:
+        hdus: Any = hdul   # see first_image_hdu for why this is typed loosely
+        for hdu in hdus:
+            if int(hdu.header.get("NAXIS", 0)) >= 2:
+                return hdu.header.copy()
+    raise ValueError("file contains no image data")
+
+
+def solve_dataset(dataset, solver, workers=None, progress=True, redo=False):
+    """Plate solve the frames of an already-measured dataset, in place.
+
+    Solving only needs the file and its header, so there is no reason to re-measure a
+    whole set (minutes per hundred frames) to add pointing to it. Frames that already
+    carry a solution are skipped unless `redo`; frames no longer at their path (moved to
+    _deleted by the review server, say) are skipped and counted.
+    """
+    rows = [r for entry in dataset for r in entry.get("files", [])
+            if "adu_mean" in r and (redo or r.get("solved_ra") is None)]
+
+    def solve_one(row):
+        path = Path(row["path"])
+        if not path.exists():
+            return "missing", None
+        try:
+            header = first_image_header(path)
+        except (OSError, ValueError):
+            return "failed", None
+        solved = solve_frame(solver, path, header, int(header["NAXIS2"]))
+        return ("solved" if solved else "failed"), solved
+
+    counts = {"solved": 0, "failed": 0, "missing": 0}
+    t0 = time.time()
+    # Threads, not processes: the work is ASTAP's, in its own subprocess per frame.
+    with ThreadPoolExecutor(max_workers=max(1, workers or os.cpu_count() or 1)) as pool:
+        futures = {pool.submit(solve_one, r): r for r in rows}
+        for done, future in enumerate(as_completed(futures), 1):
+            row = futures[future]
+            outcome, solved = future.result()
+            counts[outcome] += 1
+            if solved:
+                row.update(solved_fields(solved))
+            if progress:
+                _report_progress(done, len(rows), t0, row.get("name", ""))
+    if progress:
+        print(f"\nplate solving: {counts['solved']} solved, {counts['failed']} failed, "
+              f"{counts['missing']} no longer on disk "
+              f"({sum(len(e.get('files', [])) for e in dataset) - len(rows)} skipped)",
+              file=sys.stderr)
+    return counts
+
+
+def process_file_safe(path: Path, calib=None, solver=None, pedestal=None):
     """process_file, but a failure becomes an error row instead of aborting the run."""
     try:
-        return process_file(path, calib, solver)
+        return process_file(path, calib, solver, pedestal)
     except Exception as e:
         return {"path": str(path), "name": path.name, "error": str(e) or repr(e)}
 
@@ -1532,7 +1662,7 @@ def add_derived_adu_fields(row):
     """Backfill derived signal fields for rows loaded from older JSON caches."""
     if "adu_mean" not in row:
         return row
-    row.setdefault("signal_adu", row["adu_mean"] - BIAS_ADU)
+    row.setdefault("signal_adu", row["adu_mean"] - (row.get("pedestal_adu") or BIAS_ADU))
     row.setdefault("has_trail", False)
     row.setdefault("elong_n", 0)
     row.setdefault("elong_uniform_r", None)
@@ -1606,7 +1736,7 @@ def _make_pool(workers):
     return ProcessPoolExecutor(max_workers=workers)
 
 
-def process_paths(paths, progress=True, workers=None, calib=None, solver=None):
+def process_paths(paths, progress=True, workers=None, calib=None, solver=None, pedestal=None):
     """Measure every path, in input order. Frames are independent, so fan them out
     across workers: the per-frame cost is numpy/photutils work on a ~9 Mpx array."""
     total = len(paths)
@@ -1619,7 +1749,7 @@ def process_paths(paths, progress=True, workers=None, calib=None, solver=None):
     if workers > 1:
         try:
             with _make_pool(workers) as pool:
-                pending = {pool.submit(process_file_safe, p, calib, solver): i for i, p in enumerate(paths)}
+                pending = {pool.submit(process_file_safe, p, calib, solver, pedestal): i for i, p in enumerate(paths)}
                 for done, future in enumerate(as_completed(pending), 1):
                     i = pending[future]
                     results[i] = future.result()
@@ -1635,7 +1765,7 @@ def process_paths(paths, progress=True, workers=None, calib=None, solver=None):
     for i, path in enumerate(paths):
         if results[i] is not None:
             continue
-        results[i] = process_file_safe(path, calib, solver)
+        results[i] = process_file_safe(path, calib, solver, pedestal)
         done += 1
         if progress:
             _report_progress(done, total, t0, path.name)
@@ -1649,8 +1779,11 @@ def build_dataset(root: Path, progress=True, workers=None, darks_dir=None, calib
     # Masters are built here, in the parent, so the workers only memory-map them.
     calib = (prepare_calibration(root, darks_dir, progress=progress,
                                  calibrated_dir=calibrated_dir) if calibrate else None)
+    # The pedestal behind any frame that ends up without a dark or bias subtracted: the
+    # master bias' own level where there is one (even under --no-calibrate), else BIAS_ADU.
+    pedestal = calib.get("bias_level") if calib else master_bias_level(darks_dir)
     rows_flat = process_paths(paths, progress=progress, workers=workers, calib=calib,
-                              solver=solver)
+                              solver=solver, pedestal=pedestal)
     if progress:
         print(file=sys.stderr)
 
@@ -2466,6 +2599,12 @@ def main():
     ap.add_argument("--write-wcs", action="store_true",
                     help="With --solve, also write the WCS into each frame's own FITS header "
                          "(appends cards in place; pixel data is untouched)")
+    ap.add_argument("--solve-only", action="store_true",
+                    help="Plate solve the frames already in the JSON cache (-j) and add the "
+                         "results to it, without re-measuring anything. Frames that already "
+                         "have a solution are skipped unless --resolve is given")
+    ap.add_argument("--resolve", action="store_true",
+                    help="With --solve-only, solve frames that already have a solution again")
     ap.add_argument("--astap", default=None, metavar="PATH",
                     help="Path to the ASTAP binary, if it is not in a standard location")
     ap.add_argument("--astap-db", default=None, metavar="DIR",
@@ -2479,7 +2618,19 @@ def main():
     root = Path(args.root).resolve()
     cache = Path(args.json_cache) if args.json_cache else None
 
-    if cache and cache.exists() and not args.rescan:
+    if args.solve_only:
+        if not cache or not cache.exists():
+            sys.exit("--solve-only needs an existing JSON cache (-j); run a scan first")
+        dataset = json.loads(cache.read_text(encoding="utf-8"))
+        solver = prepare_solver(args.astap, args.astap_db, update_header=args.write_wcs)
+        if solver is None:
+            sys.exit("--solve-only: ASTAP not found (pass --astap PATH)")
+        solve_dataset(dataset, solver, workers=args.workers, redo=args.resolve)
+        dataset = add_dataset_derived_fields(dataset)
+        tmp = cache.with_name(cache.name + ".tmp")
+        tmp.write_text(json.dumps(dataset, indent=2), encoding="utf-8")
+        os.replace(tmp, cache)
+    elif cache and cache.exists() and not args.rescan:
         print(f"Using cached measurements from {cache} (pass --rescan to re-measure)",
               file=sys.stderr)
         if args.solve or args.write_wcs or args.save_calibrated:

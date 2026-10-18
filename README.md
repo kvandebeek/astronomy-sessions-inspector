@@ -38,7 +38,18 @@ python3 fits_light_stats.py [root] -o report.html -j cache.json --darks darks
 
 Also supports `--solve` (plate solve via ASTAP, recording pointing error),
 `--write-wcs`, and `--save-calibrated [dir]` to dump calibrated float32 FITS
-alongside the originals.
+alongside the originals. `--solve-only` plate solves the frames already in the
+JSON cache and adds the results to it without re-measuring anything (frames
+that already have a solution are skipped unless `--resolve` is given):
+
+```
+python3 fits_light_stats.py -j cache.json --solve-only [--write-wcs]
+```
+
+A frame with a satellite trail loses 15 quality points and is never rated
+better than "warn". Master calibration frames are cached in `<root>/.calibration`;
+masters a run no longer uses (e.g. a master flat rebuilt after adding flats)
+are removed at the end of each calibrated run.
 
 Requires: `numpy`, `astropy`, `photutils`, `scipy`, `scikit-image`.
 

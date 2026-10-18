@@ -58,6 +58,7 @@ SOURCES = (SOURCE_RAW, SOURCE_CALIBRATED)
 DELETED_SUBDIR = "_deleted"
 STATE_FILENAME = "fits_review_state.json"
 MAX_POST_BYTES = 64 * 1024
+GROUP_MEMBERS_TTL_S = 30.0   # how long a group's member list is trusted without a re-stat
 
 
 class Dataset:
@@ -68,6 +69,10 @@ class Dataset:
         self.root = root
         self.deleted_dir = root / DELETED_SUBDIR
         self.lock = threading.Lock()
+        # Bumped by every delete/restore that moved something; see group_members().
+        self.generation = 0
+        self._members_lock = threading.Lock()
+        self._members = {}
         self.raw = stats.add_dataset_derived_fields(
             json.loads(json_path.read_text(encoding="utf-8")))
 
@@ -257,6 +262,7 @@ class Dataset:
                 except Exception as e:
                     failed[fid] = str(e) or repr(e)
             if changed:
+                self.generation += 1
                 self.save_state()
         return failed
 
@@ -313,6 +319,37 @@ class Dataset:
                 for fid in folder["file_ids"]
                 if exposure is None
                 or stats.exposure_key(self.files[fid].get("exposure")) == exposure]
+
+    def group_members(self, panel: str, filt: str, exposure, source: str):
+        """file_key() of every live frame in one thumbnail group that really is in `source`.
+
+        Every thumbnail request needs this list to find its group's shared stretch, and
+        building it stats every member - so one grid of n tiles cost n*n stat calls. It is
+        kept per delete/restore generation, and re-checked after GROUP_MEMBERS_TTL_S so a
+        file rewritten on disk (a rescan with --save-calibrated) is still noticed.
+        """
+        key = (panel, filt, exposure, source)
+        now = time.monotonic()
+        with self._members_lock:
+            hit = self._members.get(key)
+            if hit and hit[0] == self.generation and now - hit[1] < GROUP_MEMBERS_TTL_S:
+                return hit[2]
+        generation = self.generation
+        live = []
+        for fid in self.group_file_ids(panel, filt, exposure):
+            if self.files[fid].get("deleted"):
+                continue
+            # Only frames that really are in this source contribute to its shared stretch.
+            if self.effective_source(fid, source) != source:
+                continue
+            try:
+                live.append(file_key(self.current_path(fid, source)))
+            except OSError:
+                continue
+        members = tuple(live)
+        with self._members_lock:
+            self._members[key] = (generation, now, members)
+        return members
 
     def group_exposures(self, panel: str, filt: str):
         """The distinct exposure lengths one panel+filter was shot at, shortest first."""
@@ -674,18 +711,8 @@ def group_stretch_limits(ds: "Dataset", panel: str, filt: str, stretch_mode: str
     pooled over 30 s and 45 s subs would sit between their two sky levels and clip both.
     Keyed on a fingerprint of the group's current (non-deleted) members, so a delete/
     restore or a rescan invalidates it rather than serving stale limits."""
-    live = []
-    for fid in ds.group_file_ids(panel, filt, exposure):
-        if ds.files[fid].get("deleted"):
-            continue
-        # Only frames that really are in this source contribute to its shared stretch.
-        if ds.effective_source(fid, source) != source:
-            continue
-        try:
-            live.append(file_key(ds.current_path(fid, source)))
-        except OSError:
-            continue
-    return group_stretches.get((panel, filt, exposure, stretch_mode, source, tuple(live)),
+    live = ds.group_members(panel, filt, exposure, source)
+    return group_stretches.get((panel, filt, exposure, stretch_mode, source, live),
                                lambda: _compute_group_stretch(live, stretch_mode))
 
 
