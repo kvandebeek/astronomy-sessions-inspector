@@ -15,11 +15,21 @@ inspecting and discarding bad frames.
     ...
   <session>/<target>/<filter>/LIGHT/...    light frames
   <session>/<target>/<filter>/FLAT/...     flats (see organize_flats.py)
+  <session>/.../DARKFLAT/...               dark flats (optional)
 ```
 
+The root may also be a single session (`<target>/<filter>/LIGHT`) or sit above
+the sessions (`<year>/<session>/...`); the two folders above `LIGHT` are always
+read as target and filter.
+
 Master bias and darks live together in one folder and are told apart by
-filename (`masterBias*.xisf` vs `masterDark*_EXPOSURE-<n>s.xisf`); darks are
-matched to a light frame by exact exposure, falling back to the bias.
+filename (`masterBias*.xisf` vs `masterDark*_EXPOSURE-<n>s.xisf`). A dark is
+matched to a light by exact exposure and must agree with it on gain, offset
+and binning wherever both say (from the master's FITS keywords or file name,
+e.g. `GAIN-100`, `BIN-1`); a mismatched master is skipped and the reason shown
+in the report's Cal column. Every master bias is used: each light gets the one
+matching its settings. Uncompressed and zlib-compressed XISF are read directly;
+lz4/zstd need the optional `lz4`/`zstandard` packages.
 
 ## Scripts
 
@@ -36,65 +46,118 @@ JSON cache.
 python3 fits_light_stats.py [root] -o report.html -j cache.json --darks darks
 ```
 
-Also supports `--solve` (plate solve via ASTAP, recording pointing error),
-`--write-wcs`, and `--save-calibrated [dir]` to dump calibrated float32 FITS
-alongside the originals. `--solve-only` plate solves the frames already in the
-JSON cache and adds the results to it without re-measuring anything (frames
-that already have a solution are skipped unless `--resolve` is given):
+- **Rescans are incremental.** `--rescan` re-measures only frames whose file,
+  masters or options changed; `--full-rescan` re-measures everything.
+- **Interrupting is safe.** Progress is checkpointed to `<cache>.partial` every
+  minute and on Ctrl+C; running the same command again continues from there.
+- **Plate solving** with ASTAP: `--solve` during a scan, or `--solve-only` to
+  add solutions to an existing cache without re-measuring (`--resolve` redoes
+  frames that already have one). `--write-wcs` also writes the WCS into each
+  frame's header, keeping the original header in `<root>/.wcs_backup`;
+  `--undo-wcs` puts them all back.
+- `--save-calibrated [dir]` writes calibrated float32 FITS alongside; a copy is
+  rewritten whenever its source or masters change.
+- `--full-scale ADU` for 12/14-bit data not scaled to 16 bit (default: the
+  `SATURATE` card, else 65535).
 
-```
-python3 fits_light_stats.py -j cache.json --solve-only [--write-wcs]
-```
+Quality score: fixed thresholds plus the frame against its own set. A frame
+with a satellite trail loses 15 points and is never rated better than "warn".
+HFR/FWHM thresholds are in pixels; set `FITS_QUALITY_REFERENCE_SCALE` (the
+arcsec/px they were tuned at) to score on angular size instead, so they carry
+over to another camera or telescope.
 
-A frame with a satellite trail loses 15 quality points and is never rated
-better than "warn". Master calibration frames are cached in `<root>/.calibration`;
-masters a run no longer uses (e.g. a master flat rebuilt after adding flats)
-are removed at the end of each calibrated run.
+Master calibration frames are cached in `<root>/.calibration`; masters a run no
+longer uses (e.g. a master flat rebuilt after adding flats) are removed at the
+end of each calibrated run.
 
-Requires: `numpy`, `astropy`, `photutils`, `scipy`, `scikit-image`.
+#### What the JSON holds per frame
+Besides the measurements: `calibration` and `calibration_warnings`,
+`settings` (gain/offset/binning/temperature), `pixel_scale_arcsec`,
+`hfr_arcsec`/`fwhm_arcsec`, the plate solve (`solved_ra`, `solved_dec`,
+`pointing_error_arcsec`, ...), `object` and the mount's `mount_ra`/`mount_dec`,
+and a **`wcs`** block for mosaic planning:
+
+| key | |
+|---|---|
+| `cards` | every WCS card verbatim, SIP distortion included — `astropy.wcs.WCS(cards)` rebuilds the exact solution |
+| `center_ra`, `center_dec` | field centre, degrees |
+| `corners` | RA/Dec of pixels (0,0), (w-1,0), (w-1,h-1), (0,h-1) |
+| `pixel_scale_arcsec`, `field_deg` | per axis |
+| `rotation_deg` | position angle of the image's +y axis, east of north |
+| `flipped` | true when the image is mirrored against the sky |
+| `source` | `astap` (plate solve) or `header` (written by the capture software) |
 
 ### `fits_review_server.py`
 Serves the same per-folder tables as a local, interactive web UI
 (`http://127.0.0.1:8765` by default). Each row is clickable and opens a
-live-rendered preview (linear or auto-stretch); you can delete a frame
-straight from there. Deleting moves the file into a `_deleted/` folder next
-to the report (mirroring its relative path) instead of erasing it, so it's
-recoverable. Only binds to localhost and only ever touches files that were
-part of the scanned dataset. Additionally requires `pillow`.
+live-rendered preview (linear or auto-stretch, 1:1 zoom, histogram levels).
+Deleting moves the file into a `_deleted/` folder next to the report
+(mirroring its relative path) instead of erasing it, so it's recoverable.
+
+- In the preview, ←/→ step through the frames in the order the table or grid
+  shows them; **Del** moves the frame to `_deleted` and steps on.
+- Select frames by verdict (reject / warn / trail / sigma-clipped), delete or
+  **restore** a whole selection, hide deleted frames, and — with a typed
+  confirmation — permanently empty `_deleted`.
+- Export a CSV of every frame, or a reject list (paths of deleted + selected
+  frames) for a stacker's exclusion list.
+- **Nights**: a per-session timeline of FWHM, sky brightness and star count.
+- Picks up a rescan automatically (the page offers a reload); frames the scan
+  could not read are listed at the top.
+
+Only binds to localhost by default and only ever touches files that were part
+of the scanned dataset. `--host 0.0.0.0` (with `--allow-host NAME` for the
+names you browse to it by) serves it to the network — anyone who can reach it
+can delete frames. `--open` opens the browser.
 
 ```
-python3 fits_review_server.py -j fits_light_data.json -r . -p 8765
+python3 fits_review_server.py -j fits_light_data.json -r . -p 8765 [--open]
 ```
 
 ### `organize_flats.py`
 Moves flats shot into one dumping folder into the per-filter `FLAT/` layout
 `fits_light_stats.py` expects, matching session/target/filter depth to how
 the lights are already laid out. Dry-run by default; `--apply` moves files
-and logs every move so `--undo <log>` can reverse it.
+(also across drives, never overwriting) and logs every move so `--undo <log>`
+can reverse it.
 
 ```
 python3 organize_flats.py [root]          # preview
 python3 organize_flats.py [root] --apply  # do it
 ```
 
-### `run_light_stats.sh` / `run_review_server.sh`
+### `run_light_stats.sh` / `run_review_server.sh` (and `.bat` on Windows)
 Convenience wrappers meant to live next to a project's own `darks/` and
 session folders. They auto-detect a sibling `../.venv` for the Python
-interpreter, and `run_review_server.sh` runs the scan first if no JSON cache
-exists yet (or always, with `--rescan`).
+interpreter, and `run_review_server` runs the scan first if no JSON cache
+exists yet (or with `--rescan` / `--full-rescan`, anywhere in its arguments).
 
 ```
 ./run_light_stats.sh [--rescan] [--solve] ...
-./run_review_server.sh [--rescan] [-p 9000]
+./run_review_server.sh [--rescan] [-p 9000] [--open]
 ```
 
 ## Setup
 
+Python 3.11 or newer.
+
 ```
 python3 -m venv .venv
-source .venv/bin/activate
-pip install numpy astropy photutils scipy scikit-image pillow
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-(`run_light_stats.sh`/`run_review_server.sh` expect this venv one directory
-above the project folder, at `../.venv`.)
+(The run scripts expect this venv one directory above the project folder, at
+`../.venv`.)
+
+## Development
+
+```
+pip install -r requirements-dev.txt
+ruff check .
+python -m pytest            # synthetic data, ~20 s
+npx eslint@9 static         # the pages' JavaScript
+```
+
+The pages' JavaScript and CSS live in `static/` and are inlined into the
+report and the review page. CI runs all three checks on every push.

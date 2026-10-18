@@ -1,0 +1,12 @@
+# Minimum versions the scripts are written against. photutils 3.0 renamed npixels ->
+# n_pixels and xcentroid -> x_centroid, which the star detection uses; it needs Python 3.11+.
+numpy>=2.0
+astropy>=6.1.4
+photutils>=3.0
+scipy>=1.13
+scikit-image>=0.24
+pillow>=10.0          # the review server's PNG previews
+
+# Optional:
+#   lz4, zstandard  - read XISF masters compressed with lz4/lz4hc/zstd (zlib needs nothing)
+#   psutil          - more accurate free-memory figure when capping scan workers

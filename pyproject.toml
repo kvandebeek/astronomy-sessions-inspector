@@ -1,0 +1,14 @@
+# Tool configuration only - the scripts are run directly, not installed as a package.
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+# pyflakes, syntax errors, pycodestyle warnings and the bugbear checks. Long lines are not
+# enforced: much of the code is explanatory comments wrapped to 92 columns already.
+select = ["F", "E9", "W", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::astropy.wcs.FITSFixedWarning"]

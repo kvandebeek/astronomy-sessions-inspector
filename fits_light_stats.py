@@ -670,13 +670,13 @@ def _xisf_decompress(raw: bytes, compression: str, name: str) -> bytes:
         try:
             import lz4.block  # type: ignore[import-not-found]
         except ImportError:
-            raise ValueError(f"{name} is lz4-compressed; pip install lz4 to read it")
+            raise ValueError(f"{name} is lz4-compressed; pip install lz4 to read it") from None
         data = lz4.block.decompress(raw, uncompressed_size=size)
     elif codec == "zstd":
         try:
             import zstandard  # type: ignore[import-not-found]
         except ImportError:
-            raise ValueError(f"{name} is zstd-compressed; pip install zstandard to read it")
+            raise ValueError(f"{name} is zstd-compressed; pip install zstandard to read it") from None
         data = zstandard.ZstdDecompressor().decompress(raw, max_output_size=size)
     else:
         raise ValueError(f"{name} uses unsupported XISF compression {codec!r}")
@@ -1428,7 +1428,7 @@ def _compact_source_mask(segm):
     # here - so read them off it instead of running a second find_objects and a second
     # full-frame bincount, which together cost about as much as the mask itself.
     linear = [
-        lab for lab, sl, area in zip(segm.labels, segm.slices, segm.areas)
+        lab for lab, sl, area in zip(segm.labels, segm.slices, segm.areas, strict=True)
         if max(sl[0].stop - sl[0].start, sl[1].stop - sl[1].start) >= TRAIL_LINEAR_MIN_EXTENT_PX
         and area / float((sl[0].stop - sl[0].start) * (sl[1].stop - sl[1].start))
         <= TRAIL_LINEAR_MAX_FILL
@@ -2063,8 +2063,8 @@ def process_file(path: Path, calib=None, opts=None):
     signature = frame_signature(plan, opts)
     # Saved before any measurement touches the array: what lands on disk is the calibrated
     # frame, not the background-subtracted one the metrics are taken from.
-    calibrated_path = write_calibrated(calib, path, data, header, calibration,
-                                       f"{signature}-{source_stat[0]}-{source_stat[1]}")
+    calibrated_path = write_calibrated(calib, path, data, header, calibration, hashlib.sha1(
+        f"{signature}-{source_stat[0]}-{source_stat[1]}".encode()).hexdigest()[:20])
     if dark_ok or flat_ok:
         # The pedestal is gone, so what is left is the sky signal itself rather than an
         # estimate made by subtracting a nominal bias.

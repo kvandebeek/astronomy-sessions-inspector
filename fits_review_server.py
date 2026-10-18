@@ -21,7 +21,6 @@ import errno
 import io
 import json
 import math
-import os
 import re
 import shutil
 import sys
@@ -245,7 +244,7 @@ class Dataset:
             raise ValueError(
                 f"{src} is outside the server root {self.root}; "
                 "start the server with -r pointing at the folder the dataset was scanned from"
-            )
+            ) from None
         dst = self._free_destination(self.deleted_dir / rel)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dst))
@@ -1191,7 +1190,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             return fid, path, file_key(path)
         except OSError:
-            raise FileNotFoundError(str(path))
+            raise FileNotFoundError(str(path)) from None
 
     @staticmethod
     def _parse_source(qs) -> str:
