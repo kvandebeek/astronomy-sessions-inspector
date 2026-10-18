@@ -251,13 +251,18 @@ function renderRows() {
     if (row._deleted !== deleted) {
       row._deleted = deleted;
       row.classList.toggle('deleted', deleted);
+    }
+    const missing = !!f.missing;
+    if (row._missing !== missing) {
+      // Deleted frames stay selectable - that is how several are restored at once - but a
+      // purged one is gone for good and has nothing left to act on.
+      row._missing = missing;
+      row.classList.toggle('missing', missing);
       const box = BOX_BY_ID.get(f.id);
       if (box) {
-        // A frame deleted from the preview must drop out of the bulk selection too,
-        // or "Delete selected" keeps counting frames that are already gone.
-        box.disabled = deleted;
+        box.disabled = missing;
         // Deferred: renderRows() refreshes the buttons once when it finishes.
-        if (deleted && box.checked) setSelected(f.id, false, true);
+        if (missing && box.checked) setSelected(f.id, false, true);
       }
     }
     if (row._clipped !== clipped) {
@@ -356,7 +361,22 @@ function setClipMetric(value) {
   updateDerivedView();
 }
 
-function openModal(id) {
+// The ids the preview's arrows walk: the table rows or grid tiles the frame was opened
+// from, in the order they are on screen. Arrowing used to walk every frame of the whole
+// dataset in scan order, whatever the table had been sorted by.
+let navIds = null;
+
+function visibleRowIds(tbody) {
+  const ids = [];
+  for (const row of tbody.rows) {
+    if (row.dataset.id === undefined || row.offsetParent === null) continue;   // hidden
+    ids.push(Number(row.dataset.id));
+  }
+  return ids;
+}
+
+function openModal(id, context) {
+  if (context) navIds = context;
   const wasOpen = document.getElementById('modal-overlay').classList.contains('open');
   const changed = curId !== id;
   curId = id;
@@ -427,11 +447,19 @@ function renderModal() {
     statSpan('Signal', fmtNum(f.signal_adu, 1) + ' ADU'),
     statSpan('Signal rate', fmtNum(f.signal_adu_per_sec, 2) + ' ADU/s'),
     statSpan('HFR', fmtNum(f.hfr_avg, 2)),
-    statSpan('FWHM', fmtNum(f.fwhm_avg, 2) + ' px'),
+    statSpan('FWHM', fmtNum(f.fwhm_avg, 2) + ' px' +
+      (numeric(f.fwhm_arcsec) ? ' (' + fmtNum(f.fwhm_arcsec, 2) + '\u2033)' : '')),
     statSpan('Stars', String(f.num_stars ?? 0)),
     statSpan('Roundness', fmtPct(f.roundness_avg, 1)),
     statSpan('Elongation dir', elongationSummary(f)),
   );
+
+  // Masters the scan skipped for this frame (another gain, binning...), or a large
+  // temperature gap: the calibration column only flags them, this says what they are.
+  const warnBox = document.getElementById('modal-warnings');
+  const warnings = f.calibration_warnings || [];
+  warnBox.hidden = !warnings.length;
+  warnBox.textContent = warnings.length ? 'Calibration: ' + warnings.join('; ') : '';
 
   markStretchButtons('', curStretch);
 
@@ -1116,18 +1144,27 @@ function setStretch(mode) {
   loadImage();   // keeps the 1:1 window where it is, just restretched
 }
 
-async function applyMove(action, ids) {
-  // One request for the whole batch: the server moves them under a single lock and
-  // rewrites the recovery state file once, rather than once per frame.
+async function postAction(action, payload) {
+  // Every write names the dataset version the page was built from: after a rescan the
+  // same ids mean other frames, and the server refuses rather than moving those.
   const res = await fetch('/api/' + action, {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ids})
+    body: JSON.stringify(Object.assign({version: REVIEW_DATA.version}, payload))
   });
   const detail = await res.json().catch(() => ({}));
+  if (res.status === 409) showReloadBanner();
   if (!res.ok) {
     alert('Action failed: ' + (detail.error || res.status));
     return null;
   }
+  return detail;
+}
+
+async function applyMove(action, ids) {
+  // One request for the whole batch: the server moves them under a single lock and
+  // rewrites the recovery state file once, rather than once per frame.
+  const detail = await postAction(action, {ids});
+  if (detail === null) return null;
   const failed = detail.failed || {};
   const nowDeleted = action === 'delete';
   for (const id of ids) {
@@ -1153,28 +1190,44 @@ async function applyMove(action, ids) {
   return failed;
 }
 
-async function toggleDelete() {
+async function toggleDelete(skipConfirm) {
   const f = FILES[curId];
+  if (f.missing) return null;
   const action = f.deleted ? 'restore' : 'delete';
-  if (action === 'delete' && !confirm('Move this frame to _deleted?\n' + f.name + '\n\nThis is reversible (Restore), the file is moved not erased.')) {
+  if (action === 'delete' && !skipConfirm && !confirm('Move this frame to _deleted?\n' + f.name + '\n\nThis is reversible (Restore), the file is moved not erased.')) {
     return;
   }
   const delBtn = document.getElementById('delete-btn');
   delBtn.disabled = true;
   try {
-    if (await applyMove(action, [f.id]) !== null) renderModal();
+    const failed = await applyMove(action, [f.id]);
+    if (failed !== null) renderModal();
+    return failed;
   } finally {
     delBtn.disabled = false;
   }
 }
 
+async function deleteAndAdvance() {
+  // Keyboard triage: Del moves the frame on screen to _deleted - no dialog, it is one
+  // click to undo - and steps on to the next one.
+  const f = FILES[curId];
+  if (!f || f.deleted || f.missing) { nextFile(1); return; }
+  const failed = await toggleDelete(true);
+  if (failed && failed[f.id] === undefined) nextFile(1);
+}
+
 function nextFile(delta) {
   if (curId === null || !FILES.length) return;
-  const n = FILES.length;
+  const list = navIds && navIds.includes(curId) ? navIds : FILES.map(f => f.id);
+  const n = list.length;
+  const at = list.indexOf(curId);
+  const hideDeleted = document.body.classList.contains('hide-deleted');
   // Skip over frames the current view hides, so arrowing follows what is on screen.
   for (let step = 1; step <= n; step++) {
-    const i = ((curId + delta * step) % n + n) % n;
-    if (!FILES[i].sigmaClipped || i === curId) { openModal(i); return; }
+    const id = list[((at + delta * step) % n + n) % n];
+    const f = FILES[id];
+    if (id === curId || (!f.sigmaClipped && !(hideDeleted && f.deleted))) { openModal(id); return; }
   }
 }
 
@@ -1366,7 +1419,7 @@ function renderGroupGrid(keepScroll = false) {
     // nothing. Spend it on the quality verdict instead - bad frames stand out while you
     // are looking at the images rather than reading the captions.
     img.style.border = '2px solid ' + verdictColor(f);
-    img.addEventListener('click', () => openModal(id));
+    img.addEventListener('click', () => openModal(id, Array.from(GRID_ITEM_BY_ID.keys())));
     const box = document.createElement('input');
     box.type = 'checkbox';
     box.className = 'grid-select';
@@ -1443,8 +1496,11 @@ document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { if (zoom100) exitZoom(); else closeModal(); }
     else if (e.key === 'ArrowRight') nextFile(1);
     else if (e.key === 'ArrowLeft') nextFile(-1);
+    else if (e.key === 'Delete' || e.key === 'Backspace') deleteAndAdvance();
     else return;
     e.preventDefault();
+  } else if (document.getElementById('timeline-overlay').classList.contains('open')) {
+    if (e.key === 'Escape') { closeTimeline(); e.preventDefault(); }
   } else if (document.getElementById('grid-overlay').classList.contains('open')) {
     if (e.key === 'Escape') closeGroupGrid();
     else if (e.key === 'ArrowRight') navigateGroup(1);
@@ -1471,15 +1527,32 @@ document.getElementById('modal-overlay').addEventListener('click', (e) => {
 // One delegated listener instead of an inline onclick on every row.
 document.querySelector('.data-pane').addEventListener('click', (e) => {
   const row = e.target.closest('tr[data-id]');
-  if (row) openModal(Number(row.dataset.id));
+  if (row) openModal(Number(row.dataset.id), visibleRowIds(row.parentElement));
 });
 
 const selectedIds = new Set();
 
+function selectedFor(action) {
+  // Selected frames the action applies to: live ones for delete, deleted-but-not-purged
+  // ones for restore. One selection can hold both, and each button counts its own.
+  return Array.from(selectedIds).filter(id => {
+    const f = FILES[id];
+    return !f.missing && (action === 'delete' ? !f.deleted : f.deleted);
+  });
+}
+
 function updateDeleteButtons() {
   const btn = document.getElementById('bulk-delete-btn');
-  btn.disabled = selectedIds.size === 0;
-  btn.textContent = 'Delete selected (' + selectedIds.size + ')';
+  const toDelete = selectedFor('delete').length, toRestore = selectedFor('restore').length;
+  btn.disabled = toDelete === 0;
+  btn.textContent = 'Delete selected (' + toDelete + ')';
+  const restoreBtn = document.getElementById('bulk-restore-btn');
+  restoreBtn.disabled = toRestore === 0;
+  restoreBtn.textContent = 'Restore selected (' + toRestore + ')';
+  const purgeable = FILES.filter(f => f.deleted && !f.missing).length;
+  const purgeBtn = document.getElementById('purge-btn');
+  purgeBtn.disabled = purgeable === 0;
+  purgeBtn.textContent = 'Empty _deleted (' + purgeable + ')';
   const gridBtn = document.getElementById('grid-delete-btn');
   const inGrid = gridSelectedIds().length;
   gridBtn.disabled = inGrid === 0;
@@ -1532,7 +1605,7 @@ async function deleteGridSelected() {
 }
 
 async function bulkDeleteSelected() {
-  const ids = Array.from(selectedIds);
+  const ids = selectedFor('delete');
   if (!ids.length) return;
   if (!confirm('Move ' + ids.length + ' selected frame(s) to _deleted?\n\nThis is reversible (Restore in the preview), files are moved not erased.')) {
     return;
@@ -1545,6 +1618,110 @@ async function bulkDeleteSelected() {
     updateDeleteButtons();
   }
 }
+
+async function bulkRestoreSelected() {
+  const ids = selectedFor('restore');
+  if (!ids.length) return;
+  const btn = document.getElementById('bulk-restore-btn');
+  btn.disabled = true;
+  try {
+    await applyMove('restore', ids);
+  } finally {
+    updateDeleteButtons();
+  }
+}
+
+async function purgeDeleted() {
+  const n = FILES.filter(f => f.deleted && !f.missing).length;
+  if (!n) return;
+  // Typed, not clicked: this is the one action in the reviewer that cannot be undone.
+  const answer = prompt('Permanently erase the ' + n + ' frame(s) in _deleted?\n\n' +
+                        'This cannot be undone. Type ' + n + ' to confirm.');
+  if (answer === null || answer.trim() !== String(n)) return;
+  const detail = await postAction('purge', {confirm: n});
+  if (detail === null) return;
+  for (const f of FILES) if (f.deleted && !(detail.failed || {})[f.id]) f.missing = true;
+  const failedIds = Object.keys(detail.failed || {});
+  if (failedIds.length) alert(failedIds.length + ' frame(s) could not be erased.');
+  updateDerivedView();
+}
+
+function setShowDeleted(show) {
+  document.body.classList.toggle('hide-deleted', !show);
+}
+
+const SELECT_RULES = {
+  reject: f => f.quality_verdict === 'reject',
+  warn: f => f.quality_verdict === 'reject' || f.quality_verdict === 'warn',
+  trail: f => !!f.has_trail,
+  clipped: f => !!f.sigmaClipped,
+};
+
+function selectBy(kind) {
+  if (!kind) return;
+  if (kind === 'none') {
+    for (const id of Array.from(selectedIds)) setSelected(id, false, true);
+  } else {
+    const rule = SELECT_RULES[kind];
+    for (const f of FILES) if (!f.deleted && !f.missing && rule(f)) setSelected(f.id, true, true);
+  }
+  updateDeleteButtons();
+}
+
+function selectGridWhere(kind) {
+  const rule = SELECT_RULES[kind];
+  for (const id of GRID_ITEM_BY_ID.keys()) if (rule(FILES[id])) setSelected(id, true, true);
+  updateDeleteButtons();
+}
+
+function download(name, text, type) {
+  const url = URL.createObjectURL(new Blob([text], {type: type}));
+  const a = Object.assign(document.createElement('a'), {href: url, download: name});
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function csvCell(v) {
+  if (v === null || v === undefined) return '';
+  const s = Array.isArray(v) ? v.join('; ') : String(v);
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+const CSV_COLUMNS = ['path', 'name', 'session', 'panel', 'filter', 'exposure', 'date_obs',
+  'quality_score', 'quality_verdict', 'quality_reasons', 'hfr_avg', 'fwhm_avg', 'fwhm_arcsec',
+  'num_stars', 'roundness_avg', 'signal_adu_per_sec', 'has_trail', 'calibration',
+  'deleted', 'sigma_clipped', 'selected'];
+
+function exportCsv() {
+  const lines = [CSV_COLUMNS.join(',')];
+  for (const f of FILES) {
+    const folder = FOLDERS[f.folder_id] || {};
+    const row = Object.assign({}, f, {session: folder.session, panel: folder.panel,
+      deleted: !!f.deleted, sigma_clipped: !!f.sigmaClipped, selected: selectedIds.has(f.id)});
+    lines.push(CSV_COLUMNS.map(c => csvCell(row[c])).join(','));
+  }
+  download('frames.csv', lines.join('\n') + '\n', 'text/csv');
+}
+
+function exportRejectList() {
+  const paths = FILES.filter(f => f.deleted || selectedIds.has(f.id)).map(f => f.path);
+  if (!paths.length) { alert('No frames are deleted or selected.'); return; }
+  download('rejected_frames.txt', paths.join('\n') + '\n', 'text/plain');
+}
+
+// --- dataset reload -------------------------------------------------------------------
+function showReloadBanner() {
+  document.getElementById('reload-banner').hidden = false;
+}
+
+setInterval(async () => {
+  try {
+    const res = await fetch('/api/version', {cache: 'no-store'});
+    if (res.ok && (await res.json()).version !== REVIEW_DATA.version) showReloadBanner();
+  } catch (e) { /* server stopped; nothing to reload from */ }
+}, 10000);
 
 function indexDom() {
   document.querySelectorAll('tr[data-id]').forEach(row => ROW_BY_ID.set(Number(row.dataset.id), row));
@@ -1576,3 +1753,204 @@ function indexDom() {
 
 indexDom();
 updateDerivedView();
+
+// --- per-night timeline ----------------------------------------------------------------
+// Three small multiples sharing one time axis - FWHM, sky brightness, star count - so focus
+// drift, a rising moon or passing cloud read at a glance. One y-scale per chart (never two
+// on one), points coloured by filter with the marker shape as a second cue: circles for
+// broadband, diamonds for narrowband, since R and H share a hue.
+const TIMELINE_METRICS = [
+  ['fwhm_avg', 'FWHM (px)', 2],
+  ['signal_adu_per_sec', 'Sky (ADU/s)', 2],
+  ['num_stars', 'Stars', 0],
+];
+const NARROWBAND = new Set(REVIEW_DATA.narrowband || []);
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+function svgEl(name, attrs) {
+  const el = document.createElementNS(SVG_NS, name);
+  for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, v);
+  return el;
+}
+
+function frameTime(f) {
+  const t = f.date_obs ? Date.parse(f.date_obs) : NaN;
+  return Number.isFinite(t) ? t : null;
+}
+
+function fmtClock(t) {
+  const d = new Date(t);
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+
+function niceTicks(lo, hi, count) {
+  const span = hi - lo || 1;
+  const step0 = span / count;
+  const mag = Math.pow(10, Math.floor(Math.log10(step0)));
+  let step = [1, 2, 5, 10].map(m => m * mag).find(st => st >= step0) || step0;
+  // At least two gridlines, or a narrow range has no scale to read against.
+  while (Math.floor(hi / step) - Math.ceil(lo / step) < 1 && step > span / 50) step /= 2;
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) {
+    out.push(Math.abs(v) < step * 1e-9 ? 0 : v);   // never a "-0" label
+  }
+  // Enough decimals to tell neighbouring ticks apart - a fixed count collapsed a narrow
+  // FWHM range (3.75, 3.80, 3.85) into one repeated label.
+  out.decimals = Math.max(0, -Math.floor(Math.log10(step) + 1e-9));
+  return out;
+}
+
+function closeTimeline() {
+  document.getElementById('timeline-overlay').classList.remove('open');
+  document.getElementById('timeline-tip').hidden = true;
+}
+
+function openTimeline(session) {
+  const frames = FILES.filter(f => !f.deleted && (FOLDERS[f.folder_id] || {}).session === session &&
+                                   frameTime(f) !== null)
+    .sort((a, b) => frameTime(a) - frameTime(b));
+  document.getElementById('timeline-title').textContent = session + ' · ' + frames.length + ' frame(s)';
+  const charts = document.getElementById('timeline-charts');
+  charts.replaceChildren();
+  const legend = document.getElementById('timeline-legend');
+  legend.replaceChildren();
+  document.getElementById('timeline-overlay').classList.add('open');
+  if (!frames.length) {
+    charts.textContent = 'None of these frames carries a DATE-OBS/DATE-LOC time.';
+    return;
+  }
+  const filters = Array.from(new Set(frames.map(f => f.filter || '?')));
+  for (const filt of filters) {
+    const item = document.createElement('span');
+    item.className = 'tl-legend-item';
+    const key = svgEl('svg', {width: 14, height: 14, viewBox: '-7 -7 14 14'});
+    key.append(timelineMarker(filt, 0, 0));
+    item.append(key, document.createTextNode(filt));
+    legend.append(item);
+  }
+  const ids = frames.map(f => f.id);
+  const t0 = frameTime(frames[0]), t1 = frameTime(frames[frames.length - 1]);
+  const pad = Math.max(60000, (t1 - t0) * 0.03);
+  const width = Math.max(320, charts.clientWidth || 900);
+  TIMELINE_METRICS.forEach(([key, label, digits], i) => {
+    charts.append(timelineChart(frames, ids, key, label, digits, t0 - pad, t1 + pad, width,
+                                i === TIMELINE_METRICS.length - 1));
+  });
+}
+
+function timelineMarker(filt, x, y) {
+  const attrs = {fill: filterColor(filt), stroke: 'var(--panel)', 'stroke-width': 2, class: 'tl-mark'};
+  if (NARROWBAND.has(filt)) {
+    return svgEl('path', Object.assign(attrs, {d: `M${x},${y - 5.5}L${x + 5.5},${y}L${x},${y + 5.5}L${x - 5.5},${y}Z`}));
+  }
+  return svgEl('circle', Object.assign(attrs, {cx: x, cy: y, r: 4.5}));
+}
+
+function timelineChart(frames, ids, key, label, digits, tmin, tmax, width, withTimeAxis) {
+  const wrap = document.createElement('div');
+  wrap.className = 'tl-chart';
+  const title = document.createElement('div');
+  title.className = 'tl-chart-title';
+  title.textContent = label;
+  wrap.append(title);
+  const pts = frames.filter(f => numeric(f[key]));
+  const H = withTimeAxis ? 150 : 128, M = {l: 52, r: 12, t: 8, b: withTimeAxis ? 26 : 8};
+  const svg = svgEl('svg', {width: width, height: H, class: 'tl-svg'});
+  wrap.append(svg);
+  if (!pts.length) {
+    const none = svgEl('text', {x: M.l, y: 30, class: 'tl-axis'});
+    none.textContent = 'not measured';
+    svg.append(none);
+    return wrap;
+  }
+  let lo = Math.min(...pts.map(f => f[key])), hi = Math.max(...pts.map(f => f[key]));
+  if (key === 'num_stars') lo = 0;
+  const span = (hi - lo) || Math.abs(hi) || 1;
+  lo = key === 'num_stars' ? 0 : lo - span * 0.08;
+  hi += span * 0.08;
+  const x = t => M.l + (t - tmin) / (tmax - tmin) * (width - M.l - M.r);
+  const y = v => M.t + (1 - (v - lo) / (hi - lo)) * (H - M.t - M.b);
+
+  const ticks = niceTicks(lo, hi, 3);
+  for (const v of ticks) {
+    svg.append(svgEl('line', {x1: M.l, x2: width - M.r, y1: y(v), y2: y(v), class: 'tl-grid'}));
+    const t = svgEl('text', {x: M.l - 6, y: y(v) + 3.5, 'text-anchor': 'end', class: 'tl-axis'});
+    t.textContent = fmtNum(v, Math.min(digits + 1, ticks.decimals));
+    svg.append(t);
+  }
+  if (withTimeAxis) {
+    const hour = 3600000;
+    const step = (tmax - tmin) > 8 * hour ? 2 * hour : ((tmax - tmin) > 3 * hour ? hour : hour / 4);
+    for (let t = Math.ceil(tmin / step) * step; t <= tmax; t += step) {
+      const lab = svgEl('text', {x: x(t), y: H - 8, 'text-anchor': 'middle', class: 'tl-axis'});
+      lab.textContent = fmtClock(t);
+      svg.append(lab);
+    }
+  }
+  // A thin line per filter, in time order, so each filter's trend reads through the gaps
+  // where the sequence switched to another filter.
+  const byFilter = new Map();
+  for (const f of pts) {
+    const k = f.filter || '?';
+    if (!byFilter.has(k)) byFilter.set(k, []);
+    byFilter.get(k).push(f);
+  }
+  // Broken where the sequence paused (a gap of several frame intervals): a line across
+  // an hour of clouds or a meridian flip would draw data that was never taken.
+  const gaps = [];
+  for (let i = 1; i < frames.length; i++) gaps.push(frameTime(frames[i]) - frameTime(frames[i - 1]));
+  const typical = median(gaps.filter(g => g > 0)) || 0;
+  const maxGap = Math.max(3 * typical, 5 * 60000);
+  for (const [filt, list] of byFilter) {
+    let run = [];
+    const flush = () => {
+      if (run.length > 1) {
+        svg.append(svgEl('polyline', {
+          points: run.map(f => x(frameTime(f)).toFixed(1) + ',' + y(f[key]).toFixed(1)).join(' '),
+          fill: 'none', stroke: filterColor(filt), 'stroke-width': 1.5, 'stroke-opacity': 0.45}));
+      }
+      run = [];
+    };
+    for (const f of list) {
+      if (run.length && frameTime(f) - frameTime(run[run.length - 1]) > maxGap) flush();
+      run.push(f);
+    }
+    flush();
+  }
+  const tip = document.getElementById('timeline-tip');
+  const modal = document.getElementById('timeline-modal');
+  for (const f of pts) {
+    const cx = x(frameTime(f)), cy = y(f[key]);
+    const g = svgEl('g', {class: 'tl-point', tabindex: 0});
+    // The hit target is bigger than the mark: a 9 px marker is hard to land on.
+    g.append(svgEl('circle', {cx: cx, cy: cy, r: 12, fill: 'transparent'}),
+             timelineMarker(f.filter || '?', cx, cy));
+    const show = (e) => {
+      tip.replaceChildren();
+      const v = document.createElement('b');
+      v.textContent = fmtNum(f[key], digits);
+      tip.append(v, ' ' + label + ' · ' + (f.filter || '?') + ' · ' + fmtClock(frameTime(f)),
+                 document.createElement('br'), f.name);
+      tip.hidden = false;
+      const box = modal.getBoundingClientRect();
+      const at = (e && e.clientX !== undefined) ? {x: e.clientX, y: e.clientY}
+        : (() => { const r = g.getBoundingClientRect(); return {x: r.right, y: r.bottom}; })();
+      tip.style.left = Math.min(box.width - 260, at.x - box.left + modal.scrollLeft + 14) + 'px';
+      tip.style.top = (at.y - box.top + modal.scrollTop + 14) + 'px';
+    };
+    g.addEventListener('pointermove', show);
+    g.addEventListener('focus', show);
+    g.addEventListener('pointerleave', () => { tip.hidden = true; });
+    g.addEventListener('blur', () => { tip.hidden = true; });
+    g.addEventListener('click', () => { closeTimeline(); openModal(f.id, ids); });
+    g.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { closeTimeline(); openModal(f.id, ids); }
+    });
+    svg.append(g);
+  }
+  return wrap;
+}
+
+document.getElementById('timeline-overlay').addEventListener('click', (e) => {
+  if (e.target.id === 'timeline-overlay') closeTimeline();
+});

@@ -92,3 +92,34 @@ h3.flash { animation: flash-section 1.4s ease-out; border-radius:4px; }
   #modal { height:min(92vh, 760px); }
   #modal-img-wrap { min-height:220px; }
 }
+
+/* --- review tools in the sidebar --- */
+.bulk-actions { display:flex; flex-wrap:wrap; gap:6px; }
+.clip-panel + .clip-panel { border-top:0; margin-top:-22px; }
+.side-tools .side-row { display:flex; flex-wrap:wrap; gap:6px; }
+.side-tools label.check { display:flex; align-items:center; gap:6px; }
+body.hide-deleted tbody tr.deleted { display:none; }
+#bulk-restore-btn:disabled, #purge-btn:disabled { opacity:0.4; cursor:default; }
+#reload-banner { position:sticky; top:0; z-index:20; margin:0 0 14px; padding:10px 14px; border:1px solid var(--accent); border-radius:8px; background:var(--panel); color:var(--text); font-size:13px; }
+#reload-banner[hidden] { display:none; }
+#modal-warnings { font-size:12px; color:#d9a441; }
+.modal-keys { margin:0; font-size:11px; }
+tr.error-row td { cursor:default; }
+
+/* --- per-night timeline --- */
+#timeline-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.6); display:none; align-items:center; justify-content:center; z-index:56; }
+#timeline-overlay.open { display:flex; }
+#timeline-modal { position:relative; background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:16px; width:min(96vw, 1200px); max-height:92vh; overflow:auto; display:flex; flex-direction:column; gap:8px; }
+#timeline-header { display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+#timeline-title { font-size:14px; font-weight:600; color:var(--text); }
+#timeline-legend { display:flex; gap:12px; flex-wrap:wrap; font-size:12px; color:var(--text); }
+.tl-legend-item { display:inline-flex; align-items:center; gap:5px; }
+.tl-chart-title { font-size:12px; color:var(--muted); margin:6px 0 2px; }
+.tl-svg { display:block; max-width:100%; }
+.tl-grid { stroke:var(--border); stroke-width:1; }
+.tl-axis { fill:var(--muted); font-size:10.5px; font-variant-numeric:tabular-nums; }
+.tl-point { cursor:pointer; outline:none; }
+.tl-point:hover .tl-mark, .tl-point:focus .tl-mark { stroke:var(--text); }
+#timeline-tip { position:absolute; z-index:3; pointer-events:none; max-width:250px; padding:6px 9px; border-radius:6px; background:var(--head); border:1px solid var(--border); color:var(--muted); font-size:11.5px; line-height:1.4; word-break:break-all; }
+#timeline-tip[hidden] { display:none; }
+#timeline-tip b { color:var(--text); font-size:13px; }

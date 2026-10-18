@@ -17,6 +17,7 @@ localhost and only ever reads/moves files that were part of the scanned
 dataset (no arbitrary path access).
 """
 import argparse
+import errno
 import io
 import json
 import math
@@ -27,6 +28,8 @@ import sys
 import threading
 import time
 import html
+import socket
+import webbrowser
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -67,6 +70,10 @@ class Dataset:
 
     def __init__(self, json_path: Path, root: Path):
         self.root = root
+        # Identifies this load of the JSON. The page sends it back with every delete or
+        # restore, so ids from a page built before a rescan can never hit the frames that
+        # the same ids name after it.
+        self.version = str(json_path.stat().st_mtime_ns)
         self.deleted_dir = root / DELETED_SUBDIR
         self.lock = threading.Lock()
         # Bumped by every delete/restore that moved something; see group_members().
@@ -78,6 +85,9 @@ class Dataset:
 
         self.folders = []
         self.files = []  # flat list, index == id
+        # Frames the scan could not read. Kept, and shown at the top of the page: dropping
+        # them made a failed frame indistinguishable from one that was never there.
+        self.errors = []
         for folder_entry in self.raw:
             folder_name = folder_entry["folder"]
             parsed = stats.parse_folder(folder_name)
@@ -85,8 +95,13 @@ class Dataset:
             file_ids = []
             for f in folder_entry["files"]:
                 if "error" in f:
+                    self.errors.append({"folder": folder_name, "name": f.get("name", ""),
+                                        "path": f.get("path", ""), "error": f["error"]})
                     continue
                 f = dict(f)
+                # The path the scan recorded. State is keyed on it, since `path` itself
+                # changes when a restore has to use another name.
+                f["source_path"] = f["path"]
                 f["id"] = len(self.files)
                 f["folder_id"] = folder_id
                 f["deleted"] = False
@@ -127,10 +142,19 @@ class Dataset:
             print(f"Ignoring unreadable {self.state_path}: {e}", file=sys.stderr)
             return
 
+        # Frames a restore had to bring back under another name (see _move_from_deleted).
+        for source, current in (state.get("renamed") or {}).items():
+            f = self.by_path.get(source)
+            if f is not None and Path(current).exists():
+                self.by_path.pop(f["path"], None)
+                f["path"] = current
+                self.by_path[current] = f
+
         for key, info in (state.get("deleted") or {}).items():
             if not isinstance(info, dict) or not info.get("deleted_path"):
                 continue
-            f = self.by_path.get(info.get("path") or key)
+            f = self.by_path.get(info.get("path") or key) or next(
+                (g for g in self.files if g["source_path"] == (info.get("path") or key)), None)
             if f is None and key.lstrip("-").isdigit():
                 idx = int(key)
                 f = self.files[idx] if 0 <= idx < len(self.files) else None
@@ -163,13 +187,17 @@ class Dataset:
         deleted frame went, so a truncated write would strand the files."""
         payload = {
             "deleted": {
-                f["path"]: {"path": f["path"], "deleted_path": f["deleted_path"]}
+                f["source_path"]: {"path": f["source_path"], "deleted_path": f["deleted_path"]}
                 for f in self.files if f.get("deleted")
-            }
+            },
+            # A restore that had to pick a new name. Without this a restart pointed the
+            # frame back at its original path - by then another file's.
+            "renamed": {
+                f["source_path"]: f["path"]
+                for f in self.files if f["path"] != f["source_path"]
+            },
         }
-        tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        os.replace(tmp, self.state_path)
+        stats.write_json_atomic(self.state_path, payload)
 
     def effective_source(self, fid: int, source: str) -> str:
         """The source a frame can actually be shown in.
@@ -266,6 +294,42 @@ class Dataset:
                 self.save_state()
         return failed
 
+    def purge_deleted(self):
+        """Permanently remove every frame currently in _deleted. Returns (count, failures).
+
+        Only files the reviewer itself moved there, and only inside the _deleted folder,
+        are touched. The frames stay listed as deleted and become `missing`.
+        """
+        removed, failed = 0, {}
+        deleted_root = self.deleted_dir.resolve()
+        with self.lock:
+            for f in self.files:
+                if not f.get("deleted") or f.get("missing"):
+                    continue
+                target = Path(f["deleted_path"]).resolve()
+                if deleted_root not in target.parents:
+                    failed[f["id"]] = "not inside _deleted; left alone"
+                    continue
+                try:
+                    target.unlink()
+                except OSError as e:
+                    failed[f["id"]] = str(e)
+                    continue
+                f["missing"] = True
+                removed += 1
+                # Tidy the now-empty mirror folders, up to _deleted itself.
+                d = target.parent
+                while d != deleted_root and deleted_root in d.parents:
+                    try:
+                        d.rmdir()
+                    except OSError:
+                        break
+                    d = d.parent
+            if removed:
+                self.generation += 1
+                self.save_state()
+        return removed, failed
+
     def delete_many(self, fids):
         return self._apply(fids, self._move_to_deleted)
 
@@ -356,6 +420,46 @@ class Dataset:
         return sorted({stats.exposure_key(self.files[fid].get("exposure"))
                        for fid in self.group_file_ids(panel, filt)},
                       key=stats.exposure_sort_key)
+
+
+class DatasetHolder:
+    """The current Dataset, reloaded when the JSON on disk changes.
+
+    A rescan used to need a server restart before the page showed anything new. The
+    file's mtime is checked at most every RELOAD_CHECK_S; a JSON that fails to load (a
+    scan halfway through writing it, say) keeps the previous dataset in service.
+    """
+
+    RELOAD_CHECK_S = 2.0
+
+    def __init__(self, json_path: Path, root: Path):
+        self.json_path, self.root = json_path, root
+        self.lock = threading.Lock()
+        self.current = Dataset(json_path, root)
+        self._checked = time.monotonic()
+
+    def get(self) -> Dataset:
+        now = time.monotonic()
+        if now - self._checked < self.RELOAD_CHECK_S:
+            return self.current
+        with self.lock:
+            self._checked = now
+            try:
+                changed = str(self.json_path.stat().st_mtime_ns) != self.current.version
+            except OSError:
+                return self.current
+            if changed:
+                try:
+                    fresh = Dataset(self.json_path, self.root)
+                except (OSError, ValueError) as e:
+                    print(f"Keeping the loaded dataset; {self.json_path} did not load: {e}",
+                          file=sys.stderr)
+                else:
+                    with self.current.lock:    # let an in-flight delete finish first
+                        self.current = fresh
+                    print(f"Reloaded {self.json_path} ({len(fresh.files)} frames)",
+                          file=sys.stderr)
+            return self.current
 
 
 class LRU:
@@ -748,7 +852,7 @@ def render_folder_rows(folder_entry, ds: Dataset, unit_ids=()):
         deleted = bool(r.get("deleted"))
         row_cls = "deleted missing" if r.get("missing") else ("deleted" if deleted else "")
         title = ' title="file no longer exists - removed outside the reviewer"' if r.get("missing") else ""
-        disabled = " disabled" if deleted else ""
+        disabled = " disabled" if r.get("missing") else ""
         parts.append(f'<tr data-id="{fid}" class="{row_cls}"{title}>')
         parts.append(f'<td><input type="checkbox" class="row-select" data-id="{fid}"{disabled}'
                       f' onclick="event.stopPropagation()"></td>')
@@ -778,7 +882,7 @@ def render_sessions_rows(sess_list, ds: Dataset):
             deleted = bool(r.get("deleted"))
             row_cls = "deleted missing" if r.get("missing") else ("deleted" if deleted else "")
             title = ' title="file no longer exists - removed outside the reviewer"' if r.get("missing") else ""
-            disabled = " disabled" if deleted else ""
+            disabled = " disabled" if r.get("missing") else ""
             parts.append(f'<tr data-id="{fid}" class="{row_cls}"{title}>')
             parts.append(f'<td><input type="checkbox" class="row-select" data-id="{fid}"{disabled}'
                           f' onclick="event.stopPropagation()"></td>')
@@ -802,7 +906,9 @@ CLIP_OPTIONS = [
 ]
 
 # Only the fields the client actually reads; the raw rows also carry path/date_obs/adu_dev.
-CLIENT_FILE_FIELDS = ("id", "name", "filter", "folder_id", "exposure", "adu_min", "adu_max",
+CLIENT_FILE_FIELDS = ("id", "name", "path", "date_obs", "filter", "folder_id", "exposure",
+                      "adu_min", "adu_max", "hfr_arcsec", "fwhm_arcsec", "scale_arcsec",
+                      "calibration_warnings", "rel_sky", "rel_stars", "rel_fwhm",
                       "adu_mean", "signal_adu", "signal_adu_per_sec", "hfr_avg", "fwhm_avg",
                       "num_stars", "roundness_avg", "deleted", "has_trail",
                       "elong_n", "elong_uniform_r", "elong_uniform_angle_deg",
@@ -824,7 +930,8 @@ def build_page(ds: Dataset) -> str:
 <aside class="filter-sidebar">
 <h1>FITS LIGHT frame review</h1>
 <div class="sub">Root: {html.escape(ds.root.name)} &nbsp;&middot;&nbsp; Generated {html.escape(time.strftime('%Y-%m-%d %H:%M'))} &nbsp;&middot;&nbsp; click a row to preview / delete, or check rows to bulk-delete</div>
-<div class="sub"><button class="btn danger" id="bulk-delete-btn" onclick="bulkDeleteSelected()" disabled>Delete selected (0)</button></div>
+<div class="sub bulk-actions"><button class="btn danger" id="bulk-delete-btn" onclick="bulkDeleteSelected()" disabled>Delete selected (0)</button>
+<button class="btn" id="bulk-restore-btn" onclick="bulkRestoreSelected()" disabled>Restore selected (0)</button></div>
 """]
 
     parts.append('<div class="clip-panel">')
@@ -841,9 +948,48 @@ def build_page(ds: Dataset) -> str:
     parts.append('<span class="meta" id="clip-total">0 clipped</span>')
     parts.append('</div>')
 
+    parts.append('<div class="clip-panel side-tools">')
+    parts.append('<label for="select-by">Select</label>')
+    parts.append('<select id="select-by" onchange="selectBy(this.value); this.value=\'\'">'
+                 '<option value="">Add to the selection&hellip;</option>'
+                 '<option value="reject">every &ldquo;reject&rdquo;</option>'
+                 '<option value="warn">every &ldquo;warn&rdquo; or worse</option>'
+                 '<option value="trail">every frame with a trail</option>'
+                 '<option value="clipped">every sigma-clipped frame</option>'
+                 '<option value="none">clear the selection</option></select>')
+    parts.append('<label class="check"><input type="checkbox" id="show-deleted" checked '
+                 'onchange="setShowDeleted(this.checked)"> Show deleted frames</label>')
+    parts.append('<button class="btn danger" id="purge-btn" onclick="purgeDeleted()" disabled>'
+                 'Empty _deleted (0)</button>')
+    parts.append('<div class="side-row"><button class="btn" onclick="exportCsv()" '
+                 'title="Every frame with its metrics, verdict and review state">Export CSV</button>'
+                 '<button class="btn" onclick="exportRejectList()" title="Paths of every frame '
+                 'deleted here or currently selected, one per line - for a stacker&rsquo;s '
+                 'rejection or exclusion list">Export reject list</button></div>')
+    if sessions:
+        parts.append('<label>Nights</label><div class="side-row">')
+        for session in sessions:
+            parts.append(f'<button class="btn" onclick="openTimeline({html.escape(json.dumps(session), quote=True)})">'
+                         f'{html.escape(session)}</button>')
+        parts.append('</div>')
+    parts.append('</div>')
+
     stats.render_metric_buttons(parts)
     parts.append('</aside>')
     parts.append('<main class="data-pane">')
+    parts.append('<div id="reload-banner" hidden>This dataset was rescanned since the page '
+                 'loaded. <button class="btn" onclick="location.reload()">Reload</button></div>')
+    if ds.errors:
+        parts.append(f'<h2>Unreadable frames ({len(ds.errors)})</h2>'
+                     '<div class="meta">The scan could not measure these; they are left '
+                     'out of every statistic below.</div>'
+                     '<div class="wrap"><table><thead><tr><th>Folder</th><th>File</th>'
+                     '<th>Error</th></tr></thead><tbody>')
+        for e in ds.errors:
+            parts.append(f'<tr class="error-row"><td>{html.escape(e["folder"])}</td>'
+                         f'<td title="{html.escape(e["path"], quote=True)}">{html.escape(e["name"])}</td>'
+                         f'<td class="err">{html.escape(str(e["error"]))}</td></tr>')
+        parts.append('</tbody></table></div>')
     parts.append('<h2>Panel &times; Session comparison</h2>')
 
     def grid_button(panel, filt, exposure, stop_propagation):
@@ -900,6 +1046,8 @@ def build_page(ds: Dataset) -> str:
         "matrixMetrics": stats.COMPARISON_METRICS,
         "filterColors": stats.FILTER_COLORS,
         "defaultFilterColor": stats.DEFAULT_FILTER_COLOR,
+        "version": ds.version,
+        "narrowband": sorted(stats.NARROWBAND_FILTERS),
     }
     js = ("const REVIEW_DATA = " + stats.json_for_script(review_data) + ";\n"
           + stats.MATRIX_TOTALS_JS + PAGE_JS + stats.SORT_TABLE_JS)
@@ -913,6 +1061,7 @@ def build_page(ds: Dataset) -> str:
     <canvas id="modal-histogram" height="96"></canvas>
     <div id="modal-levels"></div>
     <div id="modal-stats"></div>
+    <div id="modal-warnings" hidden></div>
     <div class="modal-actions">
       <button class="btn" id="linear-btn" onclick="setStretch('linear')">Linear</button>
       <button class="btn" id="auto-btn" onclick="setStretch('auto')">Auto stretch</button>
@@ -927,6 +1076,20 @@ def build_page(ds: Dataset) -> str:
       <button class="btn danger" id="delete-btn" onclick="toggleDelete()"></button>
       <button class="btn" onclick="closeModal()">Close</button>
     </div>
+    <div class="meta modal-keys">&larr; &rarr; step through the frames in the order they are shown &middot; Del moves this frame to _deleted (reversible) and steps on &middot; Esc closes</div>
+  </div>
+</div>
+<div id="timeline-overlay">
+  <div id="timeline-modal">
+    <div id="timeline-header">
+      <div id="timeline-title"></div>
+      <div id="timeline-legend"></div>
+      <span class="spacer"></span>
+      <button class="btn" onclick="closeTimeline()">Close</button>
+    </div>
+    <div class="meta">Each point is one frame, by the time it was taken. Deleted frames are left out; click a point to open it.</div>
+    <div id="timeline-charts"></div>
+    <div id="timeline-tip" hidden></div>
   </div>
 </div>
 <div id="grid-overlay">
@@ -937,6 +1100,7 @@ def build_page(ds: Dataset) -> str:
       <button class="btn" id="grid-prev-btn" onclick="navigateGroup(-1)">&lsaquo; Prev</button>
       <button class="btn" id="grid-next-btn" onclick="navigateGroup(1)">Next &rsaquo;</button>
       <span class="spacer"></span>
+      <button class="btn" onclick="selectGridWhere('reject')" title="Tick every frame in this group the quality score rejects">Select rejects</button>
       <button class="btn danger" id="grid-delete-btn" onclick="deleteGridSelected()" disabled>Delete selected (0)</button>
       <button class="btn" id="grid-raw-btn" onclick="setSource('raw')" title="Show the frames as the camera recorded them" hidden>Raw</button>
       <button class="btn" id="grid-calibrated-btn" onclick="setSource('calibrated')" title="Show the calibrated frames" hidden>Calibrated</button>
@@ -957,8 +1121,12 @@ def build_page(ds: Dataset) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    ds: Dataset = None      # type: ignore[assignment]  # set externally before server starts
+    holder: DatasetHolder = None   # type: ignore[assignment]  # set before the server starts
     allowed_hosts: frozenset = frozenset()
+
+    @property
+    def ds(self) -> Dataset:
+        return self.holder.get()
 
     # Keep-alive: the page pulls a fresh PNG per frame, and a new TCP connection
     # per preview is pure latency. Every response below sets Content-Length.
@@ -988,11 +1156,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _host_ok(self) -> bool:
+        """The request names this server. Checked on every request, reads included: with
+        DNS rebinding a hostile page can make its own name resolve to 127.0.0.1, and then
+        read previews and frame data through the victim's browser - but the Host header
+        it sends is still its own name."""
+        host = (self.headers.get("Host") or "").strip()
+        return host.lower() in self.allowed_hosts
+
     def _is_same_origin(self) -> bool:
         """A page on another origin can POST JSON here without a preflight, and these
         endpoints move files around. Require the request to name this server."""
-        host = (self.headers.get("Host") or "").strip()
-        if host.lower() not in self.allowed_hosts:
+        if not self._host_ok():
             return False
         origin = self.headers.get("Origin")
         if origin and urlparse(origin).netloc.lower() not in self.allowed_hosts:
@@ -1059,9 +1234,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if not self._host_ok():
+            self._send_json({"error": "unknown Host header"}, status=403)
+            return
         if parsed.path == "/":
             self._send_bytes(build_page(self.ds).encode(), "text/html; charset=utf-8",
                              extra_headers=[("Cache-Control", "no-store")])
+            return
+
+        if parsed.path == "/api/version":
+            self._send_bytes(json.dumps({"version": self.ds.version}).encode(),
+                             "application/json", extra_headers=[("Cache-Control", "no-store")])
             return
 
         if parsed.path == "/api/preview":
@@ -1219,24 +1402,46 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": str(e)}, status=413)
             return
 
-        action = {"/api/delete": self.ds.delete_many,
-                  "/api/restore": self.ds.restore_many}.get(parsed.path)
-        if action is None:
+        ds = self.ds
+        action = {"/api/delete": ds.delete_many, "/api/restore": ds.restore_many,
+                  "/api/purge": None}
+        if parsed.path not in action:
             self._send_empty(404)
             return
         if not self._is_same_origin():
             self._send_json({"error": "cross-origin request rejected"}, status=403)
             return
-
         try:
             payload = json.loads(body or b"{}")
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
+        if payload.get("version") != ds.version:
+            self._send_json({"error": "the dataset was rescanned since this page loaded; "
+                                      "reload the page"}, status=409)
+            return
+
+        if parsed.path == "/api/purge":
+            expected = sum(1 for f in ds.files if f.get("deleted") and not f.get("missing"))
+            # The count the user confirmed has to be the count that would go: a stale page
+            # must not purge frames someone deleted in another tab after it was shown.
+            if payload.get("confirm") != expected:
+                self._send_json({"error": f"{expected} frame(s) are in _deleted now; "
+                                          f"reload and confirm again"}, status=409)
+                return
+            removed, failed = ds.purge_deleted()
+            self._send_json({"ok": not failed, "removed": removed, "failed": failed})
+            return
+
+        try:
             requested = payload["ids"] if "ids" in payload else [payload["id"]]
             fids = [self._parse_fid(v) for v in requested]
         except Exception as e:
             self._send_json({"error": str(e) or repr(e)}, status=400)
             return
+        action = action[parsed.path]
 
-        failed = action(fids)
+        failed = action(fids)  # type: ignore[misc]
         for fid, message in failed.items():
             self.log_error("%s failed for id %s: %s", parsed.path, fid, message)
         if failed and len(failed) == len(fids):
@@ -1250,6 +1455,13 @@ def main():
     ap.add_argument("-j", "--json", default="fits_light_data.json", help="Cached dataset JSON from fits_light_stats.py")
     ap.add_argument("-r", "--root", default=".", help="Root folder the dataset was scanned from")
     ap.add_argument("-p", "--port", type=int, default=8765)
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="Address to listen on (default: this machine only). 0.0.0.0 lets "
+                         "other machines on the network in - and lets them delete frames")
+    ap.add_argument("--allow-host", action="append", default=[], metavar="NAME[:PORT]",
+                    help="Another name the page may be opened by (e.g. the capture PC's "
+                         "hostname); repeatable. Requests naming any other host are refused")
+    ap.add_argument("--open", action="store_true", help="Open the page in a browser")
     args = ap.parse_args()
 
     root = Path(args.root).resolve()
@@ -1261,19 +1473,38 @@ def main():
         print("Run fits_light_stats.py first with -j to produce it.", file=sys.stderr)
         sys.exit(1)
 
-    Handler.ds = Dataset(json_path, root)
-    Handler.allowed_hosts = frozenset({
-        f"127.0.0.1:{args.port}", f"localhost:{args.port}", f"[::1]:{args.port}",
-    })
+    Handler.holder = DatasetHolder(json_path, root)
+    names = {"127.0.0.1", "localhost", "[::1]"}
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        names |= {args.host, socket.gethostname(), socket.getfqdn()}
+        try:
+            names |= {ai[4][0] for ai in socket.getaddrinfo(socket.gethostname(), None)
+                      if ai[0] == socket.AF_INET}
+        except OSError:
+            pass
+        names.discard("0.0.0.0")
+        print("WARNING: listening beyond this machine - anyone who can reach port "
+              f"{args.port} can view and delete frames", file=sys.stderr)
+    hosts = {f"{n}:{args.port}".lower() for n in names}
+    hosts |= {(h if ":" in h else f"{h}:{args.port}").lower() for h in args.allow_host}
+    Handler.allowed_hosts = frozenset(hosts)
 
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"Serving on http://127.0.0.1:{args.port}  (Ctrl+C to stop)", file=sys.stderr)
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            sys.exit(f"Port {args.port} is already in use - is the reviewer already running? "
+                     f"Pass -p to pick another port.")
+        raise
+    url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '::') else args.host}:{args.port}"
+    print(f"Serving on {url}  (Ctrl+C to stop)", file=sys.stderr)
+    if args.open:
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping.", file=sys.stderr)
     finally:
-        server.shutdown()
         server.server_close()
 
 

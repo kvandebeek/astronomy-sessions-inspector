@@ -25,6 +25,7 @@ import subprocess
 import tempfile
 import sys
 import time
+import warnings
 from typing import Any
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -32,6 +33,8 @@ from pathlib import Path
 import numpy as np
 from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
+from astropy.wcs import WCS, FITSFixedWarning
+from astropy.wcs.utils import proj_plane_pixel_scales
 from photutils.segmentation import make_2dgaussian_kernel, detect_sources, SourceCatalog
 from scipy import ndimage
 from skimage.measure import block_reduce
@@ -44,7 +47,7 @@ SATURATION_ADU = 60000    # peak ADU above which a star is considered saturated 
 SATURATION_FRAC = SATURATION_ADU / 65535.0  # the same, as a fraction of the sensor's full scale
 # Bumped whenever a change here alters any measured number: rows from an older version are
 # then re-measured by an incremental rescan instead of being kept.
-MEASURE_VERSION = 2
+MEASURE_VERSION = 3
 WORKER_BYTES_PER_PIXEL = 40   # a scan worker's peak memory per frame pixel (see process_paths)
 CHECKPOINT_INTERVAL_S = 60    # measured rows are flushed to the checkpoint this often
 FWHM_GUESS_PX = 4.0       # matched-filter kernel FWHM used for source detection
@@ -311,6 +314,63 @@ def _wcs_value(text, key):
     return float(m.group(1)) if m else None
 
 
+# Every card needed to rebuild a frame's WCS exactly, SIP distortion terms included.
+_WCS_CARD = re.compile(r"^(WCSAXES|CTYPE[12]|CUNIT[12]|CRVAL[12]|CRPIX[12]|CDELT[12]|CROTA[12]"
+                       r"|CD[12]_[12]|PC[12]_[12]|EQUINOX|RADESYS|RADECSYS|LONPOLE|LATPOLE"
+                       r"|[AB]P?_ORDER|[AB]P?_\d+_\d+|[AB]_DMAX)$")
+
+
+def wcs_info(header, width, height, source):
+    """A frame's celestial WCS as plain JSON, or None when the header carries none.
+
+    "cards" holds every WCS card verbatim, so the exact solution - distortion included -
+    can be rebuilt with astropy.wcs.WCS(cards). The rest is that solution worked out for
+    planning a mosaic: the field centre and its four corners in RA/Dec (degrees, corners
+    in pixel order (0,0), (w-1,0), (w-1,h-1), (0,h-1) using 0-based FITS pixel centres),
+    the pixel scale per axis, the field size, the rotation - the position angle of the
+    image's +y axis, east of north - and whether the image is mirrored (flipped) against
+    the sky.
+    """
+    cards = {k: header[k] for k in header.keys() if _WCS_CARD.match(k)}
+    if not str(cards.get("CTYPE1", "")).upper().startswith("RA"):
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FITSFixedWarning)
+            w = WCS(fits.Header(cards), naxis=2)
+        if not w.has_celestial:
+            return None
+        cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
+        ra_c, dec_c = (float(v) for v in w.all_pix2world([[cx, cy]], 0)[0])
+        corners = w.all_pix2world([[0, 0], [width - 1, 0], [width - 1, height - 1],
+                                   [0, height - 1]], 0)
+        scale_x, scale_y = (float(v) * 3600.0 for v in proj_plane_pixel_scales(w.celestial))
+        cd = w.celestial.pixel_scale_matrix
+        rotation = math.degrees(math.atan2(cd[0, 1], cd[1, 1])) % 360.0
+    except Exception:       # a malformed solution must not cost the frame its measurements
+        return None
+    return {
+        "source": source,
+        "cards": cards,
+        "center_ra": ra_c, "center_dec": dec_c,
+        "corners": [[float(ra), float(dec)] for ra, dec in corners],
+        "pixel_scale_arcsec": [scale_x, scale_y],
+        "field_deg": [width * scale_x / 3600.0, height * scale_y / 3600.0],
+        "rotation_deg": rotation,
+        "flipped": bool(np.linalg.det(cd) > 0),
+        "width": int(width), "height": int(height),
+    }
+
+
+def _read_wcs_sidecar(path):
+    """ASTAP's .wcs: a FITS header with no data, normally padded like one - but read as
+    plain text lines too, which is what some versions write."""
+    try:
+        return fits.Header.fromfile(str(path))
+    except Exception:
+        return fits.Header.fromtextfile(str(path))
+
+
 def solve_frame(solver, path: Path, header, height):
     """Plate solve one frame with ASTAP.
 
@@ -348,14 +408,25 @@ def solve_frame(solver, path: Path, header, height):
             wcs_path = os.path.join(tmpdir, "s.wcs")
             if not os.path.exists(wcs_path):
                 return None
-            text = open(wcs_path, "r", errors="replace").read()
-            ra, dec = _wcs_value(text, "CRVAL1"), _wcs_value(text, "CRVAL2")
-            rot, cdelt = _wcs_value(text, "CROTA2"), _wcs_value(text, "CDELT1")
+            try:
+                solved = _read_wcs_sidecar(wcs_path)
+                ra, dec = solved.get("CRVAL1"), solved.get("CRVAL2")
+                rot, cdelt = solved.get("CROTA2"), solved.get("CDELT1")
+            except Exception:
+                solved = None
+                text = open(wcs_path, "r", errors="replace").read()
+                ra, dec = _wcs_value(text, "CRVAL1"), _wcs_value(text, "CRVAL2")
+                rot, cdelt = _wcs_value(text, "CROTA2"), _wcs_value(text, "CDELT1")
         if ra is None or dec is None:
             return None
         result = {"ra": float(ra), "dec": float(dec),
                   "rotation": float(rot) if rot is not None else None,
                   "scale_arcsec": abs(float(cdelt)) * 3600.0 if cdelt is not None else None}
+        width = int(header.get("NAXIS1") or 0)
+        if solved is not None and width:
+            result["wcs"] = wcs_info(solved, width, height, "astap")
+            if result["wcs"] and result["scale_arcsec"] is None:
+                result["scale_arcsec"] = float(np.mean(result["wcs"]["pixel_scale_arcsec"]))
         # How far the mount's own idea of where it was pointing turned out to be off.
         hra, hdec = header.get("RA"), header.get("DEC")
         if isinstance(hra, (int, float)) and isinstance(hdec, (int, float)):
@@ -1968,8 +2039,18 @@ def process_file(path: Path, calib=None, opts=None):
     calibration = plan["label"]
     dark_ok = dark is not None and dark.shape == data.shape
     flat_ok = flat_field is not None and flat_field.shape == data.shape
+    pedestal = plan["pedestal"] if plan["pedestal"] is not None else opts.get("pedestal")
     if dark_ok:
         data -= dark
+    elif flat_ok:
+        # A flat divides signal, not the sensor's offset. Dividing a light that still
+        # carries its ~2800 ADU pedestal imprinted the vignetting onto the pedestal - a
+        # fake gradient of hundreds of ADU, which hid faint trails - so without a dark or
+        # bias the nominal pedestal comes off first.
+        nominal = pedestal if pedestal is not None else BIAS_ADU
+        data -= np.float32(nominal)
+        warnings.append(f"flat applied without a master bias; a nominal {nominal:.0f} ADU "
+                        f"pedestal was subtracted first")
     if flat_ok:
         data /= flat_field
     # A master that does not match the frame's size is skipped above; the label has to say
@@ -1984,8 +2065,7 @@ def process_file(path: Path, calib=None, opts=None):
     # frame, not the background-subtracted one the metrics are taken from.
     calibrated_path = write_calibrated(calib, path, data, header, calibration,
                                        f"{signature}-{source_stat[0]}-{source_stat[1]}")
-    pedestal = plan["pedestal"] if plan["pedestal"] is not None else opts.get("pedestal")
-    if dark_ok:
+    if dark_ok or flat_ok:
         # The pedestal is gone, so what is left is the sky signal itself rather than an
         # estimate made by subtracting a nominal bias.
         signal_adu = float(data.mean(dtype=np.float64))
@@ -2021,6 +2101,7 @@ def process_file(path: Path, calib=None, opts=None):
         "calibration_warnings": warnings,
         "calibrated_path": calibrated_path,
         **solved_fields(None),
+        **header_pointing(header, w, h),
         "date_obs": str(header.get("DATE-LOC", header.get("DATE-OBS", ""))).strip(),
         "settings": settings,
         "full_scale_adu": full_scale,
@@ -2056,12 +2137,25 @@ def process_file(path: Path, calib=None, opts=None):
 
 
 def solved_fields(solved):
-    """The row fields a plate solve fills in, all None when it did not solve."""
+    """The row fields a plate solve fills in, all None when it did not solve. The full
+    WCS only when the solve produced one: a frame's own header WCS is not overwritten
+    by nothing."""
     solved = solved or {}
-    return {"solved_ra": solved.get("ra"), "solved_dec": solved.get("dec"),
-            "solved_rotation": solved.get("rotation"),
-            "solved_scale_arcsec": solved.get("scale_arcsec"),
-            "pointing_error_arcsec": solved.get("error_arcsec")}
+    out = {"solved_ra": solved.get("ra"), "solved_dec": solved.get("dec"),
+           "solved_rotation": solved.get("rotation"),
+           "solved_scale_arcsec": solved.get("scale_arcsec"),
+           "pointing_error_arcsec": solved.get("error_arcsec")}
+    if solved.get("wcs"):
+        out["wcs"] = solved["wcs"]
+    return out
+
+
+def header_pointing(header, width, height):
+    """What the header says about where the frame points: its own WCS if the capture
+    software wrote one, the OBJECT name, and the mount's RA/Dec."""
+    return {"wcs": wcs_info(header, width, height, "header"),
+            "object": str(header.get("OBJECT", "")).strip() or None,
+            "mount_ra": _number(header.get("RA")), "mount_dec": _number(header.get("DEC"))}
 
 
 def first_image_header(path: Path):
@@ -2422,6 +2516,16 @@ def build_dataset(root: Path, progress=True, workers=None, darks_dir=None, calib
     for i, path in enumerate(paths):
         prev = previous.get(str(path))
         if _reusable(prev, path, calib, opts):
+            if "wcs" not in prev:
+                # Rows from before the WCS export: the header alone has it, so there is
+                # no reason to re-measure the frame for it.
+                try:
+                    header = first_image_header(path)
+                    prev.update({k: v for k, v in header_pointing(
+                        header, int(header["NAXIS1"]), int(header["NAXIS2"])).items()
+                        if k not in prev or k == "wcs"})
+                except (OSError, ValueError, KeyError):
+                    prev["wcs"] = None
             rows_flat[i] = prev
         else:
             todo.append(i)
