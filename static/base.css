@@ -1,0 +1,35 @@
+:root {
+  --bg: #0b0d12; --panel:#12151c; --border:#232837; --text:#e6e9f0; --muted:#8a93a6;
+  --accent:#5aa9ff; --good:#3ecf8e; --bad:#ff6b6b; --head:#1a1f2b;
+}
+@media (prefers-color-scheme: light) {
+  :root { --bg:#f7f8fa; --panel:#ffffff; --border:#e2e5ea; --text:#1b1e26; --muted:#5b6472;
+           --accent:#1868c9; --good:#0e8f5b; --bad:#c62828; --head:#eef1f6; }
+}
+* { box-sizing: border-box; }
+body { background:var(--bg); color:var(--text); font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; margin:0; }
+h1 { font-size:20px; margin:0 0 4px; }
+.sub { color:var(--muted); font-size:13px; margin-bottom:24px; }
+h2 { font-size:17px; margin:36px 0 4px; color:var(--accent); font-weight:700; }
+h3 { font-size:14px; margin:20px 0 6px; color:var(--text); font-weight:600; opacity:0.85; }
+h4 { font-size:12.5px; margin:14px 0 6px; color:var(--muted); font-weight:600; }
+.meta { color:var(--muted); font-size:12px; margin-bottom:10px; }
+table { border-collapse:collapse; width:100%; font-size:12.5px; background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+th, td { padding:6px 10px; text-align:right; border-bottom:1px solid var(--border); white-space:nowrap; }
+th:first-child, td:first-child { text-align:left; }
+th { background:var(--head); color:var(--muted); font-weight:600; position:sticky; top:0; }
+tbody tr:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.dev-pos { color: var(--bad); }
+.dev-neg { color: var(--good); }
+.q-good { color: var(--good); font-weight:600; }
+.q-warn { color: #d9a441; font-weight:600; }
+.q-reject { color: var(--bad); font-weight:600; }
+.cal-tag { color: var(--muted); font-size:11px; letter-spacing:0.03em; }
+.cal-warn { color: #d9a441; font-weight:700; }
+.wrap { overflow-x:auto; border-radius:8px; }
+.err { color:var(--bad); font-style:italic; text-align:left; }
+th.sortable { cursor:pointer; user-select:none; }
+th.sortable:hover { color:var(--text); }
+th.sortable::after { content:''; display:inline-block; width:0.7em; margin-left:3px; opacity:0.4; }
+th.sort-asc::after { content:'\2191'; opacity:1; }
+th.sort-desc::after { content:'\2193'; opacity:1; }

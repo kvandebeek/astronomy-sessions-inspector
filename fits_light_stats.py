@@ -2769,85 +2769,23 @@ MATRIX_TOTAL_COLUMNS = [
     ("exposure", "Total exposure"),
 ]
 
+# The pages' JavaScript and CSS live in static/ as ordinary files, so they can be linted and
+# edited as what they are; both the report and the review page inline them, which keeps
+# the report a single self-contained HTML file.
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+def static_text(name):
+    return (STATIC_DIR / name).read_text(encoding="utf-8")
+
+
 # Shared by the static report and the review server so the two can never disagree about
 # what a row total says.
-MATRIX_TOTALS_JS = """
-function splitExposure(minutes) {
-  if (minutes === null || minutes === undefined || Number.isNaN(minutes)) return null;
-  let h = Math.floor(minutes / 60);
-  let m = Math.round(minutes - h * 60);
-  // A value like 119.7 min rounds to 60 on the minute part; carry it rather than show "1h 60m".
-  if (m === 60) { h += 1; m = 0; }
-  return {h: h, m: m};
-}
+MATRIX_TOTALS_JS = static_text("matrix_totals.js")
 
-function fmtTotalExposure(minutes) {
-  const t = splitExposure(minutes);
-  if (!t) return '\\u2014';
-  return t.h ? t.h + 'h ' + t.m + 'm' : t.m + 'm';
-}
+MATRIX_CSS = static_text("matrix.css")
 
-// "20m" and "1h 9m" right-aligned as one string still do not line up, because they are a
-// different number of tokens. Each part gets its own fixed-width slot instead, so the
-// minutes share an edge down the column whether or not there is an hour beside them.
-function setRowTotal(cell, kind, frames, minutes, any) {
-  cell.replaceChildren();
-  if (!any) { cell.textContent = '\\u2014'; return; }
-  if (kind === 'frames') { cell.textContent = String(frames); return; }
-  const t = splitExposure(minutes);
-  if (!t) { cell.textContent = '\\u2014'; return; }
-  const hours = document.createElement('span');
-  hours.className = 'exp-h';
-  hours.textContent = t.h ? t.h + 'h' : '';
-  const mins = document.createElement('span');
-  mins.className = 'exp-m';
-  mins.textContent = t.m + 'm';
-  cell.append(hours, mins);
-}
-
-function rowTotalKey(kind, frames, minutes, any) {
-  return !any ? '-' : (kind === 'frames' ? String(frames) : fmtTotalExposure(minutes));
-}
-"""
-
-MATRIX_CSS = """
-.matrix-wrap { overflow-x:auto; margin-bottom:8px; }
-table.matrix { border-collapse:collapse; width:100%; background:var(--panel); border:1px solid var(--border); border-radius:8px; }
-table.matrix th, table.matrix td { padding:8px 12px; border-bottom:1px solid var(--border); border-right:1px solid var(--border); vertical-align:top; }
-table.matrix th { background:var(--head); color:var(--muted); font-weight:600; text-align:center; }
-table.matrix tbody tr { background:var(--filter-tint); }
-table.matrix th:first-child,
-table.matrix th:nth-child(2),
-table.matrix td.matrix-panel,
-table.matrix td.matrix-filter { text-align:left; font-weight:600; color:var(--text); }
-table.matrix td.matrix-cell { text-align:right; }
-table.matrix tbody td.matrix-panel { background:var(--head); }
-table.matrix tbody td.matrix-filter { background:rgba(255,255,255,0.035); }
-table.matrix .empty { color:var(--muted); }
-/* Row totals: the same row read across every session, so they sit past a heavier rule
-   that marks where the per-session columns stop. */
-table.matrix th.matrix-total, table.matrix td.matrix-total { text-align:right; }
-table.matrix th.total-first, table.matrix td.total-first { border-left:2px solid var(--border); }
-table.matrix td.matrix-total { font-weight:600; color:var(--text); font-variant-numeric:tabular-nums; }
-.exp-h { display:inline-block; min-width:2.2em; text-align:right; }
-.exp-m { display:inline-block; min-width:2.9em; text-align:right; }
-.metric-btn { font:inherit; font-size:12px; padding:5px 11px; border-radius:999px; border:1px solid var(--border); background:var(--panel); color:var(--muted); cursor:pointer; }
-.metric-btn:hover { border-color:var(--accent); color:var(--text); }
-.metric-btn.active { background:var(--accent); border-color:var(--accent); color:#0b0d12; font-weight:600; }
-.cell-line { display:flex; align-items:center; gap:6px; font-size:12px; white-space:nowrap; }
-.swatch { width:9px; height:9px; border-radius:50%; flex:none; }
-.row-exp { color:var(--muted); font-weight:400; font-size:11px; }
-/* The filter letter and the exposure label are both variable width ("R 30s" vs "H 180s"),
-   which pushed the buttons after them to a different x on every row. Fixed slots keep the
-   whole column of buttons on one left edge. */
-.row-filter { display:inline-block; min-width:0.9em; }
-.row-exp-fixed { display:inline-block; min-width:2.9em; text-align:right; font-variant-numeric:tabular-nums; }
-.cell-val { font-variant-numeric: tabular-nums; }
-"""
-
-COMPARISON_CSS = MATRIX_CSS + """
-.metric-row { display:flex; flex-wrap:wrap; gap:6px; margin:10px 0 16px; }
-"""
+COMPARISON_CSS = MATRIX_CSS + static_text("report.css")
 
 
 def render_metric_buttons(parts):
@@ -2928,54 +2866,10 @@ def build_comparison_section(dataset):
     render_metric_buttons(parts)
     render_matrix_skeleton(parts, panels, sessions, rows)
 
-    parts.append(f"""<script>{MATRIX_TOTALS_JS}
-const COMP = {json_for_script(comp)};
-const COMP_METRICS = {json_for_script(COMPARISON_METRICS)};
-let matrixMetric = COMP_METRICS[0][0];
-
-function fmtMetric(v, digits, pct) {{
-  if (v === null || v === undefined || Number.isNaN(v)) return '&mdash;';
-  const opts = {{minimumFractionDigits: digits, maximumFractionDigits: digits}};
-  return pct ? (v * 100).toLocaleString(undefined, opts) + '%' : Number(v).toLocaleString(undefined, opts);
-}}
-
-function renderMatrix() {{
-  const [, , digits, pct] = COMP_METRICS.find(m => m[0] === matrixMetric) || COMP_METRICS[0];
-  document.querySelectorAll('.matrix-cell').forEach(cell => {{
-    const byFilter = (COMP[cell.dataset.panel] || {{}})[cell.dataset.session] || {{}};
-    const agg = (byFilter[cell.dataset.filter] || {{}})[cell.dataset.exposure];
-    cell.innerHTML = agg
-      ? '<span class="cell-val">' + fmtMetric(agg[matrixMetric], digits, pct) + '</span>'
-      : '<span class="empty">&mdash;</span>';
-  }});
-  renderMatrixTotals();
-}}
-
-function renderMatrixTotals() {{
-  // One row is one panel+filter at one exposure; the total is that row read across
-  // every session column.
-  document.querySelectorAll('.matrix-total[data-total]').forEach(cell => {{
-    const bySession = COMP[cell.dataset.panel] || {{}};
-    let frames = 0, minutes = 0, any = false;
-    for (const session of Object.keys(bySession)) {{
-      const agg = ((bySession[session] || {{}})[cell.dataset.filter] || {{}})[cell.dataset.exposure];
-      if (!agg) continue;
-      any = true;
-      if (typeof agg.frames === 'number') frames += agg.frames;
-      if (typeof agg.total_exp_min === 'number') minutes += agg.total_exp_min;
-    }}
-    setRowTotal(cell, cell.dataset.total, frames, minutes, any);
-  }});
-}}
-
-function setMatrixMetric(key) {{
-  matrixMetric = key;
-  document.querySelectorAll('.metric-btn').forEach(b => b.classList.toggle('active', b.dataset.metric === key));
-  renderMatrix();
-}}
-
-renderMatrix();
-</script>""")
+    parts.append("<script>" + MATRIX_TOTALS_JS
+                 + "\nconst COMP = " + json_for_script(comp) + ";\n"
+                 + "const COMP_METRICS = " + json_for_script(COMPARISON_METRICS) + ";\n"
+                 + static_text("comparison.js") + "</script>")
 
     return "\n".join(parts)
 
@@ -3145,117 +3039,9 @@ def render_sessions_table(sess_list):
     return parts
 
 
-BASE_CSS = """
-:root {
-  --bg: #0b0d12; --panel:#12151c; --border:#232837; --text:#e6e9f0; --muted:#8a93a6;
-  --accent:#5aa9ff; --good:#3ecf8e; --bad:#ff6b6b; --head:#1a1f2b;
-}
-@media (prefers-color-scheme: light) {
-  :root { --bg:#f7f8fa; --panel:#ffffff; --border:#e2e5ea; --text:#1b1e26; --muted:#5b6472;
-           --accent:#1868c9; --good:#0e8f5b; --bad:#c62828; --head:#eef1f6; }
-}
-* { box-sizing: border-box; }
-body { background:var(--bg); color:var(--text); font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; margin:0; }
-h1 { font-size:20px; margin:0 0 4px; }
-.sub { color:var(--muted); font-size:13px; margin-bottom:24px; }
-h2 { font-size:17px; margin:36px 0 4px; color:var(--accent); font-weight:700; }
-h3 { font-size:14px; margin:20px 0 6px; color:var(--text); font-weight:600; opacity:0.85; }
-h4 { font-size:12.5px; margin:14px 0 6px; color:var(--muted); font-weight:600; }
-.meta { color:var(--muted); font-size:12px; margin-bottom:10px; }
-table { border-collapse:collapse; width:100%; font-size:12.5px; background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
-th, td { padding:6px 10px; text-align:right; border-bottom:1px solid var(--border); white-space:nowrap; }
-th:first-child, td:first-child { text-align:left; }
-th { background:var(--head); color:var(--muted); font-weight:600; position:sticky; top:0; }
-tbody tr:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
-.dev-pos { color: var(--bad); }
-.dev-neg { color: var(--good); }
-.q-good { color: var(--good); font-weight:600; }
-.q-warn { color: #d9a441; font-weight:600; }
-.q-reject { color: var(--bad); font-weight:600; }
-.cal-tag { color: var(--muted); font-size:11px; letter-spacing:0.03em; }
-.cal-warn { color: #d9a441; font-weight:700; }
-.wrap { overflow-x:auto; border-radius:8px; }
-.err { color:var(--bad); font-style:italic; text-align:left; }
-th.sortable { cursor:pointer; user-select:none; }
-th.sortable:hover { color:var(--text); }
-th.sortable::after { content:''; display:inline-block; width:0.7em; margin-left:3px; opacity:0.4; }
-th.sort-asc::after { content:'\\2191'; opacity:1; }
-th.sort-desc::after { content:'\\2193'; opacity:1; }
-"""
+BASE_CSS = static_text("base.css")
 
-SORT_TABLE_JS = """
-(function () {
-  // An em-dash is how every formatter here writes "no value", so it is missing data
-  // rather than text. Counting it as text made any metric column with one unmeasured
-  // frame sort as strings, putting "11.40" above "2.05" in HFR, ADU, quality and the
-  // rest. Blank cells were already treated this way; the dash just never was.
-  var MISSING = /^[\\s\\u2013\\u2014-]*$/;
-  // The whole cell has to read as a number ("1,234.5", "+12.3", "85.0%"). Stripping every
-  // non-digit and parsing what was left turned a filename like "Light_M31_30.00s_0001.fits"
-  // into 30, so the File column sorted as numbers that were all the same.
-  var NUMBER = /^[+\\-\\u2212]?[\\d.,]*\\d\\s*%?$/;
-
-  function cellSortValue(td) {
-    var raw = td.textContent.trim();
-    if (MISSING.test(raw)) return { raw: raw, num: null, missing: true };
-    if (!NUMBER.test(raw)) return { raw: raw, num: null, missing: false };
-    var num = parseFloat(raw.replace(/\\u2212/, '-').replace(/[^0-9.\\-]+/g, ''));
-    return { raw: raw, num: isNaN(num) ? null : num, missing: false };
-  }
-
-  function columnIsNumeric(rows, idx) {
-    var seen = 0, numeric = 0;
-    for (var i = 0; i < rows.length; i++) {
-      var cell = rows[i].cells[idx];
-      if (!cell) continue;
-      var v = cellSortValue(cell);
-      if (v.missing) continue;
-      seen++;
-      if (v.num !== null) numeric++;
-    }
-    return seen > 0 && numeric === seen;
-  }
-
-  function sortTable(table, th) {
-    var idx = th.cellIndex;
-    var tbody = table.tBodies[0];
-    var rows = Array.prototype.slice.call(tbody.rows);
-    var errorRows = rows.filter(function (r) { return r.cells.length <= idx || r.querySelector('.err'); });
-    var dataRows = rows.filter(function (r) { return errorRows.indexOf(r) === -1; });
-
-    var asc = th.classList.contains('sort-asc') ? false : true;
-    Array.prototype.forEach.call(table.querySelectorAll('th.sortable'), function (h) {
-      h.classList.remove('sort-asc', 'sort-desc');
-    });
-    th.classList.add(asc ? 'sort-asc' : 'sort-desc');
-
-    var numeric = columnIsNumeric(dataRows, idx);
-    dataRows.sort(function (a, b) {
-      var av = cellSortValue(a.cells[idx]);
-      var bv = cellSortValue(b.cells[idx]);
-      // Missing values go last in either direction. As -Infinity they compared NaN against
-      // each other (-Infinity - -Infinity), which leaves the sort order undefined.
-      if (av.missing || bv.missing) return av.missing === bv.missing ? 0 : (av.missing ? 1 : -1);
-      var cmp;
-      if (numeric) {
-        cmp = av.num - bv.num;
-      } else {
-        // numeric collation: "session 2" before "session 10", "_0002" before "_0010".
-        cmp = av.raw.localeCompare(bv.raw, undefined, { numeric: true, sensitivity: 'base' });
-      }
-      return asc ? cmp : -cmp;
-    });
-
-    dataRows.concat(errorRows).forEach(function (r) { tbody.appendChild(r); });
-  }
-
-  document.querySelectorAll('table.sortable-table').forEach(function (table) {
-    table.querySelectorAll('th.sortable').forEach(function (th) {
-      th.addEventListener('click', function () { sortTable(table, th); });
-    });
-  });
-})();
-"""
+SORT_TABLE_JS = static_text("sort_table.js")
 
 
 def build_html(dataset, root_name):
