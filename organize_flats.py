@@ -22,7 +22,9 @@ Usage:
     python3 organize_flats.py [root] [--apply] [--undo LOG]
 """
 import argparse
+import errno
 import os
+import shutil
 import sys
 import time
 from collections import defaultdict
@@ -200,13 +202,30 @@ def remove_empty_dirs(start: Path, stop: Path):
         d = d.parent
 
 
+def move_file(src: Path, dst: Path):
+    """Move one file without ever overwriting another.
+
+    A rename where possible - instant, and nothing is copied - and a copy-then-delete when
+    source and destination are on different drives, where rename refuses (EXDEV). The
+    explicit existence check matters on macOS/Linux, where rename replaces silently.
+    """
+    if dst.exists():
+        raise FileExistsError(f"destination already exists: {dst}")
+    try:
+        os.rename(src, dst)
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+        shutil.move(str(src), str(dst))
+
+
 def apply_moves(root: Path, moves):
     log = root / f"flat_moves_{time.strftime('%Y%m%d-%H%M%S')}.tsv"
     done = 0
     with log.open("a", encoding="utf-8") as out:
         for src, dst in moves:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            os.rename(src, dst)  # same volume, so this is instant and never copies
+            move_file(src, dst)
             out.write(f"{src}\t{dst}\n")
             out.flush()
             done += 1
@@ -226,7 +245,7 @@ def undo(root: Path, log: Path):
         sys.exit("undo aborted, nothing changed")
     for src, dst in reversed(lines):
         Path(src).parent.mkdir(parents=True, exist_ok=True)
-        os.rename(dst, src)
+        move_file(Path(dst), Path(src))
         remove_empty_dirs(Path(dst).parent, root)
     print(f"moved {len(lines)} flats back")
 
