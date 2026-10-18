@@ -107,3 +107,24 @@ def test_unreadable_frame_becomes_an_error_row(project):
     err = [r for r in rows(dataset) if "error" in r]
     assert [r["name"] for r in err] == ["L_1_zzz.fits"]
     st.write_json_atomic(project / "c.json", dataset)    # an all-error folder must not NaN
+
+
+def test_save_calibrated_on_a_later_rescan_writes_the_copies(project, tmp_path):
+    previous = {r["path"]: r for r in rows(scan(project))}
+    out = tmp_path / "cal"
+    dataset = scan(project, previous=previous, calibrated_dir=out)
+    assert all(r["calibrated_path"] and st.Path(r["calibrated_path"]).exists()
+               for r in rows(dataset))
+
+
+def test_failed_solves_are_not_retried(project, monkeypatch):
+    dataset = scan(project)
+    calls = []
+    monkeypatch.setattr(st, "solve_frame", lambda *a: calls.append(a[1]))
+    solver = {"astap": "x", "update_header": False}
+    st.solve_dataset(dataset, solver, progress=False)
+    assert len(calls) == 10
+    st.solve_dataset(dataset, solver, progress=False)
+    assert len(calls) == 10                     # nothing changed, nothing retried
+    st.solve_dataset(dataset, solver, progress=False, redo=True)
+    assert len(calls) == 20

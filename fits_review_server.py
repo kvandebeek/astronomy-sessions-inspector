@@ -127,6 +127,7 @@ class Dataset:
         self.by_path = {f["path"]: f for f in self.files}
         self.units = self.build_units()
         self.state_path = root / STATE_FILENAME
+        self.orphan_state = {}     # deleted frames the current JSON does not list
         self._load_state()
 
     def _load_state(self):
@@ -158,6 +159,9 @@ class Dataset:
                 idx = int(key)
                 f = self.files[idx] if 0 <= idx < len(self.files) else None
             if f is None:
+                # Not in this scan - a rescan never sees frames sitting in _deleted. Kept,
+                # so the record of where each one came from survives the next save.
+                self.orphan_state[key] = info
                 continue
             f["deleted"] = True
             f["deleted_path"] = info["deleted_path"]
@@ -184,11 +188,13 @@ class Dataset:
     def save_state(self):
         """Written via a temp file + replace: this is the only record of where a
         deleted frame went, so a truncated write would strand the files."""
+        deleted = dict(self.orphan_state)
+        deleted.update({
+            f["source_path"]: {"path": f["source_path"], "deleted_path": f["deleted_path"]}
+            for f in self.files if f.get("deleted")
+        })
         payload = {
-            "deleted": {
-                f["source_path"]: {"path": f["source_path"], "deleted_path": f["deleted_path"]}
-                for f in self.files if f.get("deleted")
-            },
+            "deleted": deleted,
             # A restore that had to pick a new name. Without this a restart pointed the
             # frame back at its original path - by then another file's.
             "renamed": {
@@ -448,16 +454,18 @@ class DatasetHolder:
             except OSError:
                 return self.current
             if changed:
-                try:
-                    fresh = Dataset(self.json_path, self.root)
-                except (OSError, ValueError) as e:
-                    print(f"Keeping the loaded dataset; {self.json_path} did not load: {e}",
-                          file=sys.stderr)
-                else:
-                    with self.current.lock:    # let an in-flight delete finish first
-                        self.current = fresh
-                    print(f"Reloaded {self.json_path} ({len(fresh.files)} frames)",
-                          file=sys.stderr)
+                # Under the old dataset's lock: a delete still in flight on it writes the
+                # state file, and the new dataset has to be built from that write, not
+                # from the state before it.
+                with self.current.lock:
+                    try:
+                        fresh = Dataset(self.json_path, self.root)
+                    except (OSError, ValueError) as e:
+                        print(f"Keeping the loaded dataset; {self.json_path} did not load: {e}",
+                              file=sys.stderr)
+                        return self.current
+                    self.current = fresh
+                print(f"Reloaded {self.json_path} ({len(fresh.files)} frames)", file=sys.stderr)
             return self.current
 
 
@@ -908,6 +916,7 @@ CLIP_OPTIONS = [
 CLIENT_FILE_FIELDS = ("id", "name", "path", "date_obs", "filter", "folder_id", "exposure",
                       "adu_min", "adu_max", "hfr_arcsec", "fwhm_arcsec", "scale_arcsec",
                       "calibration_warnings", "rel_sky", "rel_stars", "rel_fwhm",
+                      "solved_ra", "solved_dec", "solved_rotation", "pointing_error_arcsec",
                       "adu_mean", "signal_adu", "signal_adu_per_sec", "hfr_avg", "fwhm_avg",
                       "num_stars", "roundness_avg", "deleted", "has_trail",
                       "elong_n", "elong_uniform_r", "elong_uniform_angle_deg",
@@ -1417,7 +1426,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if payload.get("version") != ds.version:
             self._send_json({"error": "the dataset was rescanned since this page loaded; "
-                                      "reload the page"}, status=409)
+                                      "reload the page", "stale": True}, status=409)
             return
 
         if parsed.path == "/api/purge":
@@ -1474,6 +1483,8 @@ def main():
 
     Handler.holder = DatasetHolder(json_path, root)
     names = {"127.0.0.1", "localhost", "[::1]"}
+    if ":" in args.host and args.host != "::":
+        names.add(f"[{args.host}]")
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         names |= {args.host, socket.gethostname(), socket.getfqdn()}
         try:
@@ -1488,14 +1499,21 @@ def main():
     hosts |= {(h if ":" in h else f"{h}:{args.port}").lower() for h in args.allow_host}
     Handler.allowed_hosts = frozenset(hosts)
 
+    server_class = ThreadingHTTPServer
+    if ":" in args.host:
+        class _V6Server(ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+        server_class = _V6Server
     try:
-        server = ThreadingHTTPServer((args.host, args.port), Handler)
+        server = server_class((args.host, args.port), Handler)
     except OSError as e:
         if e.errno == errno.EADDRINUSE:
             sys.exit(f"Port {args.port} is already in use - is the reviewer already running? "
                      f"Pass -p to pick another port.")
         raise
-    url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '::') else args.host}:{args.port}"
+    shown = {"0.0.0.0": "127.0.0.1", "::": "[::1]"}.get(
+        args.host, f"[{args.host}]" if ":" in args.host else args.host)
+    url = f"http://{shown}:{args.port}"
     print(f"Serving on {url}  (Ctrl+C to stop)", file=sys.stderr)
     if args.open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()

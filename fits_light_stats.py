@@ -301,12 +301,8 @@ def find_astap_db(explicit=None):
 
 def frame_fov_deg(header, height):
     """Field height in degrees from the optics, not from any assumed pointing."""
-    pixel_um = header.get("XPIXSZ") or header.get("PIXSIZE1")
-    focal_mm = header.get("FOCALLEN")
-    binning = header.get("XBINNING", 1) or 1
-    if not (isinstance(pixel_um, (int, float)) and isinstance(focal_mm, (int, float)) and focal_mm > 0):
-        return None
-    return height * (206.265 * pixel_um * binning / focal_mm) / 3600.0
+    scale = frame_pixel_scale(header)
+    return height * scale / 3600.0 if scale else None
 
 
 def _wcs_value(text, key):
@@ -467,10 +463,15 @@ def backup_header(solver, path: Path, header):
     os.replace(tmp, out)
 
 
-def undo_wcs(root: Path):
-    """Restore every header saved by backup_header(), leaving the pixel data alone."""
+def undo_wcs(root: Path, cache=None):
+    """Restore every header saved by backup_header(), leaving the pixel data alone.
+
+    With the JSON cache given, the restored frames' rows get their new file identity, so
+    the next incremental rescan does not re-measure every frame for a header-only change.
+    """
     backups = sorted((root / WCS_BACKUP_DIRNAME).rglob("*.hdr"))
     restored = 0
+    restored_paths = set()
     for backup in backups:
         relative = backup.relative_to(root / WCS_BACKUP_DIRNAME)
         target = root / str(relative)[:-len(".hdr")]
@@ -490,7 +491,20 @@ def undo_wcs(root: Path):
                     break
         backup.unlink()
         restored += 1
+        restored_paths.add(str(target))
     print(f"restored {restored} original header(s)", file=sys.stderr)
+    if cache and Path(cache).exists() and restored_paths:
+        dataset = json.loads(Path(cache).read_text(encoding="utf-8"))
+        for entry in dataset:
+            for row in entry.get("files", []):
+                if row.get("path") in restored_paths:
+                    try:
+                        row["source_stat"] = _stat_of(Path(row["path"]))
+                    except OSError:
+                        continue
+                    if (row.get("wcs") or {}).get("source") == "header":
+                        row["wcs"] = None       # that WCS was ours, and is gone now
+        write_json_atomic(Path(cache), dataset)
 
 
 def prepare_solver(astap=None, db=None, update_header=False, progress=True, root=None):
@@ -2177,8 +2191,14 @@ def solve_dataset(dataset, solver, workers=None, progress=True, redo=False):
     already carry a solution are skipped unless `redo`; frames no longer at their path
     (moved to _deleted by the review server, say) are skipped and counted.
     """
-    rows = [r for entry in dataset for r in entry.get("files", [])
-            if "adu_mean" in r and (redo or r.get("solved_ra") is None)]
+    def wanted(r):
+        if "adu_mean" not in r or (r.get("solved_ra") is not None and not redo):
+            return False
+        # A frame ASTAP already failed on, unchanged since, fails again - and an unsolvable
+        # (cloudy, star-poor) frame can take the full timeout every time it is retried.
+        return redo or r.get("solve_failed") != r.get("source_stat")
+
+    rows = [r for entry in dataset for r in entry.get("files", []) if wanted(r)]
     if not rows:
         return {"solved": 0, "failed": 0, "missing": 0}
 
@@ -2201,7 +2221,10 @@ def solve_dataset(dataset, solver, workers=None, progress=True, redo=False):
             row = futures[future]
             outcome, solved = future.result()
             counts[outcome] += 1
+            if outcome == "failed":
+                row["solve_failed"] = row.get("source_stat")
             if solved:
+                row.pop("solve_failed", None)
                 row.update(solved_fields(solved))
                 if solver.get("update_header"):
                     # --write-wcs rewrote the file; record its new identity, or the next
@@ -2213,7 +2236,8 @@ def solve_dataset(dataset, solver, workers=None, progress=True, redo=False):
             if progress:
                 _report_progress(done, len(rows), t0, row.get("name", ""))
     if progress:
-        print(f"\nplate solving: {counts['solved']} solved, {counts['failed']} failed, "
+        print(f"\nplate solving: {counts['solved']} solved, {counts['failed']} failed "
+              f"(not retried until the frame changes, or --resolve), "
               f"{counts['missing']} no longer on disk "
               f"({sum(len(e.get('files', [])) for e in dataset) - len(rows)} skipped)",
               file=sys.stderr)
@@ -2466,6 +2490,12 @@ def _reusable(prev, path: Path, calib, opts):
             return False
     except OSError:
         return False
+    if calib and calib.get("calibrated_dir"):
+        # --save-calibrated asked for now: a row kept from a run without it has no
+        # calibrated copy on disk, and only measuring the frame writes one.
+        saved = prev.get("calibrated_path")
+        if not saved or not Path(saved).exists():
+            return False
     plan = calibration_plan(calib, path, prev.get("exposure"), prev.get("filter"),
                             prev.get("settings") or {})
     return frame_signature(plan, opts) == prev.get("scan_sig")
@@ -2996,7 +3026,8 @@ def fmt_elongation(r):
 
 
 CALIBRATION_HINT = {
-    "Cal": "Calibration applied: D = master dark, B = master bias, F = master flat",
+    "Cal": ("Calibration applied: D = master dark, B = master bias, F = master flat. "
+            "! = a master was skipped or is a poor match; hover the cell for why"),
     "ADU min": "As recorded by the sensor, before calibration",
     "ADU max": "As recorded by the sensor, before calibration - 65535 means a star hit the ceiling",
     "ADU mean": "As recorded by the sensor, before calibration",
@@ -3232,7 +3263,7 @@ def main():
     root = Path(args.root).resolve()
     cache = Path(args.json_cache) if args.json_cache else None
     if args.undo_wcs:
-        undo_wcs(root)
+        undo_wcs(root, cache)
         return
     rescan = args.rescan or args.full_rescan
 

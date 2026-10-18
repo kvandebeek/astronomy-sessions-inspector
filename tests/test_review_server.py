@@ -115,3 +115,18 @@ def test_unreadable_frames_are_listed(scanned):
     ds = rv.Dataset(cache, root)
     assert ds.errors and ds.errors[0]["name"] == "x.fits"
     assert "Unreadable frames (1)" in rv.build_page(ds)
+
+
+def test_deleted_frames_outside_the_scan_keep_their_record(scanned):
+    root, cache = scanned
+    ds = rv.Dataset(cache, root)
+    source = ds.files[0]["source_path"]
+    ds.delete_many([0])
+    # A rescan no longer lists the frame (it sits in _deleted now).
+    data = json.loads(cache.read_text())
+    data[0]["files"] = [r for r in data[0]["files"] if r["path"] != source]
+    st.write_json_atomic(cache, data)
+    again = rv.Dataset(cache, root)
+    again.delete_many([0])                      # any write rewrites the state file
+    state = json.loads((root / rv.STATE_FILENAME).read_text())
+    assert source in state["deleted"]

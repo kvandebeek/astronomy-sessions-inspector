@@ -1152,7 +1152,7 @@ async function postAction(action, payload) {
     body: JSON.stringify(Object.assign({version: REVIEW_DATA.version}, payload))
   });
   const detail = await res.json().catch(() => ({}));
-  if (res.status === 409) showReloadBanner();
+  if (res.status === 409 && detail.stale) showReloadBanner();
   if (!res.ok) {
     alert('Action failed: ' + (detail.error || res.status));
     return null;
@@ -1692,6 +1692,7 @@ function csvCell(v) {
 const CSV_COLUMNS = ['path', 'name', 'session', 'panel', 'filter', 'exposure', 'date_obs',
   'quality_score', 'quality_verdict', 'quality_reasons', 'hfr_avg', 'fwhm_avg', 'fwhm_arcsec',
   'num_stars', 'roundness_avg', 'signal_adu_per_sec', 'has_trail', 'calibration',
+  'solved_ra', 'solved_dec', 'solved_rotation', 'pointing_error_arcsec',
   'deleted', 'sigma_clipped', 'selected'];
 
 function exportCsv() {
