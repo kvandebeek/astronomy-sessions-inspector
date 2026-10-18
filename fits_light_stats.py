@@ -10,7 +10,8 @@ an HTML report with one table per LIGHT folder.
 Usage:
     python3 fits_light_stats.py [root_dir] [-o output.html] [-j cache.json] [-w workers]
 
-Requires: numpy, astropy, photutils  (pip install numpy astropy photutils)
+Requires: numpy, astropy, photutils, scipy, scikit-image
+    (pip install numpy astropy photutils scipy scikit-image)
 """
 import argparse
 import hashlib
@@ -24,6 +25,7 @@ import subprocess
 import tempfile
 import sys
 import time
+import warnings
 from typing import Any
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -31,15 +33,23 @@ from pathlib import Path
 import numpy as np
 from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
+from astropy.wcs import WCS, FITSFixedWarning
+from astropy.wcs.utils import proj_plane_pixel_scales
 from photutils.segmentation import make_2dgaussian_kernel, detect_sources, SourceCatalog
 from scipy import ndimage
 from skimage.measure import block_reduce
 from skimage.transform import hough_line
 
 FITS_EXTS = {".fit", ".fits", ".fts"}
-EXCLUDED_DIR_NAMES = {"_deleted", ".calibration", "calibrated"}
-BIAS_ADU = 2796.0        # measured average bias pedestal, subtracted for signal estimates
+EXCLUDED_DIR_NAMES = {"_deleted", ".calibration", ".wcs_backup", "calibrated"}
+BIAS_ADU = 2796.0        # fallback bias pedestal for signal estimates when no master bias is known
 SATURATION_ADU = 60000    # peak ADU above which a star is considered saturated and skipped
+SATURATION_FRAC = SATURATION_ADU / 65535.0  # the same, as a fraction of the sensor's full scale
+# Bumped whenever a change here alters any measured number: rows from an older version are
+# then re-measured by an incremental rescan instead of being kept.
+MEASURE_VERSION = 3
+WORKER_BYTES_PER_PIXEL = 40   # a scan worker's peak memory per frame pixel (see process_paths)
+CHECKPOINT_INTERVAL_S = 60    # measured rows are flushed to the checkpoint this often
 FWHM_GUESS_PX = 4.0       # matched-filter kernel FWHM used for source detection
 DETECT_SIGMA = 5.0        # detection threshold = DETECT_SIGMA * background sigma
 MIN_NPIXELS = 9           # minimum connected above-threshold pixels to count as a source
@@ -115,8 +125,17 @@ QUALITY_RELATIVE = {
     "rel_sky": (1.3, 3.0, 15),       # sky brightness: moon, twilight, lit clouds
 }
 QUALITY_RELATIVE_MIN_SET = 5
+# The pixel scale (arcsec/px) the HFR/FWHM thresholds above were tuned at. Set it - here or
+# through the FITS_QUALITY_REFERENCE_SCALE environment variable - and frames whose scale is
+# known (plate solve, or FOCALLEN + XPIXSZ) are scored on angular size instead, so the
+# thresholds carry over to another camera or telescope. Unset, they stay plain pixels.
+REFERENCE_PIXEL_SCALE_ARCSEC = float(os.environ.get("FITS_QUALITY_REFERENCE_SCALE") or 0) or None
 QUALITY_WARN_MAX = 70    # score < this -> "warn"
 QUALITY_REJECT_MAX = 40  # score < this -> "reject"
+# A trail is one line through an otherwise fine frame, and a stacker's pixel rejection
+# usually removes it - so it costs a fixed amount rather than sinking the frame. It does
+# cap the verdict at "warn", though: green in the review grid should mean nothing to look at.
+QUALITY_TRAIL_PENALTY = 15
 
 
 def _ramp_penalty(value, good, bad, max_penalty):
@@ -134,6 +153,10 @@ def compute_quality(r):
     stars detected) fall through to a low score with an explicit reason rather than a
     misleadingly neutral one."""
     hfr, fwhm = r.get("hfr_avg"), r.get("fwhm_avg")
+    # Scored in "reference pixels" when the frame's own scale is known (see above); the
+    # reasons still quote the frame's own pixels, which is what its numbers are in.
+    scale = r.get("solved_scale_arcsec") or r.get("pixel_scale_arcsec")
+    to_ref = (scale / REFERENCE_PIXEL_SCALE_ARCSEC) if REFERENCE_PIXEL_SCALE_ARCSEC and scale else 1.0
     stars, roundness = r.get("num_stars"), r.get("roundness_avg")
     uniform_r, radial_r = r.get("elong_uniform_r"), r.get("elong_radial_r")
     trail = bool(r.get("has_trail"))
@@ -143,14 +166,14 @@ def compute_quality(r):
 
     if hfr is not None:
         good, bad, mx = QUALITY_THRESHOLDS["hfr"]
-        p = _ramp_penalty(hfr, good, bad, mx)
+        p = _ramp_penalty(hfr * to_ref, good, bad, mx)
         score -= p
         if p >= mx * 0.3:
             reasons.append(f"high HFR ({hfr:.1f}px)")
 
     if fwhm is not None:
         good, bad, mx = QUALITY_THRESHOLDS["fwhm"]
-        p = _ramp_penalty(fwhm, good, bad, mx)
+        p = _ramp_penalty(fwhm * to_ref, good, bad, mx)
         score -= p
         if p >= mx * 0.3:
             reasons.append(f"high FWHM ({fwhm:.1f}px)")
@@ -191,6 +214,7 @@ def compute_quality(r):
             reasons.append(describe(value))
 
     if trail:
+        score -= QUALITY_TRAIL_PENALTY
         reasons.insert(0, "satellite trail")
 
     if stars == 0 or (hfr is None and fwhm is None and stars is None):
@@ -199,6 +223,8 @@ def compute_quality(r):
 
     score = max(0.0, min(100.0, score))
     verdict = "reject" if score < QUALITY_REJECT_MAX else "warn" if score < QUALITY_WARN_MAX else "good"
+    if trail and verdict == "good":
+        verdict = "warn"
     return score, reasons, verdict
 
 _HOUGH_NORM_CACHE = {}   # (pooled shape, n_theta) -> per-bin pixel counts, built once
@@ -228,6 +254,7 @@ def scan_light_dirs(root: Path, exclude=()):
     found = {}
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIR_NAMES
+                       and not d.startswith(".")
                        and (Path(dirpath) / d).resolve() not in pruned]
         directory = Path(dirpath)
         light_dir = _enclosing_light_dir(root, directory)
@@ -250,6 +277,9 @@ ASTAP_CANDIDATES = (
 )
 ASTAP_DB_CANDIDATES = ("/usr/local/opt/astap", "/usr/local/share/astap", "/opt/homebrew/share/astap")
 ASTAP_SEARCH_RADIUS_DEG = 30.0   # generous: far beyond any plausible mount error, still fast
+# ASTAP is multithreaded itself, so a few at a time already fill the machine.
+ASTAP_CONCURRENCY = max(1, min(4, (os.cpu_count() or 4) // 4))
+WCS_BACKUP_DIRNAME = ".wcs_backup"   # original headers, saved before --write-wcs touches them
 
 
 def find_astap(explicit=None):
@@ -271,17 +301,70 @@ def find_astap_db(explicit=None):
 
 def frame_fov_deg(header, height):
     """Field height in degrees from the optics, not from any assumed pointing."""
-    pixel_um = header.get("XPIXSZ") or header.get("PIXSIZE1")
-    focal_mm = header.get("FOCALLEN")
-    binning = header.get("XBINNING", 1) or 1
-    if not (isinstance(pixel_um, (int, float)) and isinstance(focal_mm, (int, float)) and focal_mm > 0):
-        return None
-    return height * (206.265 * pixel_um * binning / focal_mm) / 3600.0
+    scale = frame_pixel_scale(header)
+    return height * scale / 3600.0 if scale else None
 
 
 def _wcs_value(text, key):
     m = re.search(key + r"\s*=\s*([-+0-9.eE]+)", text)
     return float(m.group(1)) if m else None
+
+
+# Every card needed to rebuild a frame's WCS exactly, SIP distortion terms included.
+_WCS_CARD = re.compile(r"^(WCSAXES|CTYPE[12]|CUNIT[12]|CRVAL[12]|CRPIX[12]|CDELT[12]|CROTA[12]"
+                       r"|CD[12]_[12]|PC[12]_[12]|EQUINOX|RADESYS|RADECSYS|LONPOLE|LATPOLE"
+                       r"|[AB]P?_ORDER|[AB]P?_\d+_\d+|[AB]_DMAX)$")
+
+
+def wcs_info(header, width, height, source):
+    """A frame's celestial WCS as plain JSON, or None when the header carries none.
+
+    "cards" holds every WCS card verbatim, so the exact solution - distortion included -
+    can be rebuilt with astropy.wcs.WCS(cards). The rest is that solution worked out for
+    planning a mosaic: the field centre and its four corners in RA/Dec (degrees, corners
+    in pixel order (0,0), (w-1,0), (w-1,h-1), (0,h-1) using 0-based FITS pixel centres),
+    the pixel scale per axis, the field size, the rotation - the position angle of the
+    image's +y axis, east of north - and whether the image is mirrored (flipped) against
+    the sky.
+    """
+    cards = {k: header[k] for k in header.keys() if _WCS_CARD.match(k)}
+    if not str(cards.get("CTYPE1", "")).upper().startswith("RA"):
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FITSFixedWarning)
+            w = WCS(fits.Header(cards), naxis=2)
+        if not w.has_celestial:
+            return None
+        cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
+        ra_c, dec_c = (float(v) for v in w.all_pix2world([[cx, cy]], 0)[0])
+        corners = w.all_pix2world([[0, 0], [width - 1, 0], [width - 1, height - 1],
+                                   [0, height - 1]], 0)
+        scale_x, scale_y = (float(v) * 3600.0 for v in proj_plane_pixel_scales(w.celestial))
+        cd = w.celestial.pixel_scale_matrix
+        rotation = math.degrees(math.atan2(cd[0, 1], cd[1, 1])) % 360.0
+    except Exception:       # a malformed solution must not cost the frame its measurements
+        return None
+    return {
+        "source": source,
+        "cards": cards,
+        "center_ra": ra_c, "center_dec": dec_c,
+        "corners": [[float(ra), float(dec)] for ra, dec in corners],
+        "pixel_scale_arcsec": [scale_x, scale_y],
+        "field_deg": [width * scale_x / 3600.0, height * scale_y / 3600.0],
+        "rotation_deg": rotation,
+        "flipped": bool(np.linalg.det(cd) > 0),
+        "width": int(width), "height": int(height),
+    }
+
+
+def _read_wcs_sidecar(path):
+    """ASTAP's .wcs: a FITS header with no data, normally padded like one - but read as
+    plain text lines too, which is what some versions write."""
+    try:
+        return fits.Header.fromfile(str(path))
+    except Exception:
+        return fits.Header.fromtextfile(str(path))
 
 
 def solve_frame(solver, path: Path, header, height):
@@ -301,6 +384,7 @@ def solve_frame(solver, path: Path, header, height):
 
     tmpdir = None
     if solver.get("update_header"):
+        backup_header(solver, path, header)
         cmd += ["-update"]
     else:
         # Solve without touching the frame: send ASTAP's sidecars to a scratch directory.
@@ -309,8 +393,9 @@ def solve_frame(solver, path: Path, header, height):
     try:
         subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if solver.get("update_header"):
-            with fits.open(str(path), memmap=False) as hdul:
-                solved = first_image_hdu(hdul).header
+            # Header only: the old path went through first_image_hdu, which reads the
+            # whole image just to find out the HDU has one.
+            solved = first_image_header(path)
             if not solved.get("PLTSOLVD"):
                 return None
             ra, dec = solved.get("CRVAL1"), solved.get("CRVAL2")
@@ -319,14 +404,25 @@ def solve_frame(solver, path: Path, header, height):
             wcs_path = os.path.join(tmpdir, "s.wcs")
             if not os.path.exists(wcs_path):
                 return None
-            text = open(wcs_path, "r", errors="replace").read()
-            ra, dec = _wcs_value(text, "CRVAL1"), _wcs_value(text, "CRVAL2")
-            rot, cdelt = _wcs_value(text, "CROTA2"), _wcs_value(text, "CDELT1")
+            try:
+                solved = _read_wcs_sidecar(wcs_path)
+                ra, dec = solved.get("CRVAL1"), solved.get("CRVAL2")
+                rot, cdelt = solved.get("CROTA2"), solved.get("CDELT1")
+            except Exception:
+                solved = None
+                text = open(wcs_path, "r", errors="replace").read()
+                ra, dec = _wcs_value(text, "CRVAL1"), _wcs_value(text, "CRVAL2")
+                rot, cdelt = _wcs_value(text, "CROTA2"), _wcs_value(text, "CDELT1")
         if ra is None or dec is None:
             return None
         result = {"ra": float(ra), "dec": float(dec),
                   "rotation": float(rot) if rot is not None else None,
                   "scale_arcsec": abs(float(cdelt)) * 3600.0 if cdelt is not None else None}
+        width = int(header.get("NAXIS1") or 0)
+        if solved is not None and width:
+            result["wcs"] = wcs_info(solved, width, height, "astap")
+            if result["wcs"] and result["scale_arcsec"] is None:
+                result["scale_arcsec"] = float(np.mean(result["wcs"]["pixel_scale_arcsec"]))
         # How far the mount's own idea of where it was pointing turned out to be off.
         hra, hdec = header.get("RA"), header.get("DEC")
         if isinstance(hra, (int, float)) and isinstance(hdec, (int, float)):
@@ -341,7 +437,77 @@ def solve_frame(solver, path: Path, header, height):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def prepare_solver(astap=None, db=None, update_header=False, progress=True):
+def _backup_path(solver, path: Path):
+    root = Path(solver["root"])
+    try:
+        relative = Path(path).resolve().relative_to(root)
+    except ValueError:
+        relative = Path(hashlib.sha1(str(path).encode()).hexdigest()[:12]) / Path(path).name
+    return root / WCS_BACKUP_DIRNAME / (str(relative) + ".hdr")
+
+
+def backup_header(solver, path: Path, header):
+    """Keep the frame's original header before ASTAP rewrites it in place.
+
+    Only the first backup is ever kept - a re-solve must not overwrite the true original
+    with an already-solved header. --undo-wcs puts them back.
+    """
+    if not solver.get("root"):
+        return
+    out = _backup_path(solver, path)
+    if out.exists():
+        return
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.name + ".tmp")
+    tmp.write_text(header.tostring(), encoding="ascii", errors="replace")
+    os.replace(tmp, out)
+
+
+def undo_wcs(root: Path, cache=None):
+    """Restore every header saved by backup_header(), leaving the pixel data alone.
+
+    With the JSON cache given, the restored frames' rows get their new file identity, so
+    the next incremental rescan does not re-measure every frame for a header-only change.
+    """
+    backups = sorted((root / WCS_BACKUP_DIRNAME).rglob("*.hdr"))
+    restored = 0
+    restored_paths = set()
+    for backup in backups:
+        relative = backup.relative_to(root / WCS_BACKUP_DIRNAME)
+        target = root / str(relative)[:-len(".hdr")]
+        if not target.exists():
+            print(f"  skipped (frame no longer there): {target}", file=sys.stderr)
+            continue
+        original = fits.Header.fromstring(backup.read_text(encoding="ascii"))
+        # do_not_scale_image_data: the raw integers go back exactly as stored, with the
+        # original BZERO/BSCALE, instead of being rescaled through floats on the way.
+        with fits.open(str(target), mode="update", do_not_scale_image_data=True) as hdul:
+            for hdu in hdul:
+                if int(hdu.header.get("NAXIS", 0)) >= 2:
+                    # Rewritten card by card: assigning a freshly parsed Header leaves it
+                    # flagged unmodified, and flush() then silently keeps the old one.
+                    hdu.header.clear()
+                    hdu.header.extend(original, strip=False, unique=False)
+                    break
+        backup.unlink()
+        restored += 1
+        restored_paths.add(str(target))
+    print(f"restored {restored} original header(s)", file=sys.stderr)
+    if cache and Path(cache).exists() and restored_paths:
+        dataset = json.loads(Path(cache).read_text(encoding="utf-8"))
+        for entry in dataset:
+            for row in entry.get("files", []):
+                if row.get("path") in restored_paths:
+                    try:
+                        row["source_stat"] = _stat_of(Path(row["path"]))
+                    except OSError:
+                        continue
+                    if (row.get("wcs") or {}).get("source") == "header":
+                        row["wcs"] = None       # that WCS was ours, and is gone now
+        write_json_atomic(Path(cache), dataset)
+
+
+def prepare_solver(astap=None, db=None, update_header=False, progress=True, root=None):
     """Picklable solver config for the workers, or None if ASTAP is unavailable."""
     binary = find_astap(astap)
     if not binary:
@@ -353,7 +519,8 @@ def prepare_solver(astap=None, db=None, update_header=False, progress=True):
         print(f"plate solving: {binary}"
               f"{' with ' + database if database else ' (database auto-detected by ASTAP)'}"
               f"{', writing WCS into each header' if update_header else ''}", file=sys.stderr)
-    return {"astap": binary, "db": database, "update_header": bool(update_header)}
+    return {"astap": binary, "db": database, "update_header": bool(update_header),
+            "root": str(root) if root else None}
 
 
 # --- Calibration ---------------------------------------------------------------------------
@@ -361,69 +528,217 @@ def prepare_solver(astap=None, db=None, update_header=False, progress=True):
 # the workers memory-map them read-only, so the operating system shares one copy of each
 # master across every worker instead of giving each its own ~36 MB.
 CALIB_DIRNAME = ".calibration"      # cache of prepared masters, under the scan root
+CALIB_INDEX_NAME = "masters.json"   # what each cached bias/dark is, for runs without --darks
 XISF_SIGNATURE = b"XISF0100"
 FLAT_DIR_NAME = "FLAT"
 LIGHT_DIR_NAME = "LIGHT"
+# Folders capture software puts dark flats in (compared upper-cased, separators ignored).
+DARKFLAT_DIR_NAMES = {"DARKFLAT", "DARKFLATS", "FLATDARK", "FLATDARKS"}
+# Settings that must agree between a light and the master calibrating it. Any one missing
+# on either side is not held against the match - plenty of masters only carry some.
+MATCH_SETTINGS = ("gain", "offset", "binning")
+DARK_TEMP_TOLERANCE_C = 2.0          # sensor temperature difference worth a warning
+DARKFLAT_EXPOSURE_TOLERANCE = 0.10   # a dark flat within 10% of a flat's exposure matches it
+MASTER_FLAT_READ_THREADS = 4         # flats are read concurrently; the combine stays single
 
 _MASTER_CACHE = {}   # path -> memmapped array, per worker process
 
 
-def _xisf_image_spec(path: Path):
-    """(offset, shape, dtype, scale) of the single image in a monolithic XISF file.
+def _number(value):
+    """A header value as a float, or None when it is missing or not a number."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        v = float(str(value).strip().strip("'").strip())
+    except ValueError:
+        return None
+    return v if math.isfinite(v) else None
 
-    PixInsight writes masters as an XML header followed by the raw samples at a byte
-    offset the header states, so an uncompressed one can be read - or memory-mapped -
-    without a XISF library. Compressed blocks are refused rather than mis-read.
-    """
+
+def frame_settings(header):
+    """{gain, offset, binning, temp} of a frame or master, from whichever cards it has."""
+    out = {}
+    gain = _number(header.get("GAIN"))
+    if gain is not None:
+        out["gain"] = gain
+    offset = _number(header.get("OFFSET", header.get("BLKLEVEL")))
+    if offset is not None:
+        out["offset"] = offset
+    xb = _number(header.get("XBINNING"))
+    if xb is not None:
+        yb = _number(header.get("YBINNING")) or xb
+        out["binning"] = f"{int(xb)}x{int(yb)}"
+    temp = _number(header.get("CCD-TEMP", header.get("SET-TEMP")))
+    if temp is not None:
+        out["temp"] = temp
+    return out
+
+
+def _settings_from_name(name):
+    """Settings PixInsight's WBPP and most capture tools put in a master's file name."""
+    out = {}
+    for key, pattern in (("gain", r"GAIN[-_]?(\d+(?:\.\d+)?)"),
+                         ("offset", r"OFFSET[-_]?(\d+(?:\.\d+)?)"),
+                         ("temp", r"TEMP(?:ERATURE)?[-_]?(-?\d+(?:\.\d+)?)")):
+        m = re.search(pattern, name, re.IGNORECASE)
+        if m:
+            out[key] = float(m.group(1))
+    m = re.search(r"BIN(?:NING)?[-_]?(\d+)(?:x(\d+))?", name, re.IGNORECASE)
+    if m:
+        out["binning"] = f"{m.group(1)}x{m.group(2) or m.group(1)}"
+    return out
+
+
+def settings_conflicts(master_settings, frame):
+    """The MATCH_SETTINGS on which a master and a frame disagree, as readable strings."""
+    conflicts = []
+    for key in MATCH_SETTINGS:
+        a, b = (master_settings or {}).get(key), (frame or {}).get(key)
+        if a is None or b is None:
+            continue
+        same = a == b if key == "binning" else abs(float(a) - float(b)) < 0.5
+        if not same:
+            conflicts.append(f"{key} {a:g} vs {b:g}" if key != "binning" else f"{key} {a} vs {b}")
+    return conflicts
+
+
+def _temp_gap(master_settings, frame):
+    a, b = (master_settings or {}).get("temp"), (frame or {}).get("temp")
+    return None if a is None or b is None else abs(a - b)
+
+
+def _xisf_header(path: Path):
     with open(path, "rb") as f:
         if f.read(8) != XISF_SIGNATURE:
             raise ValueError(f"{path.name} is not an XISF 1.0 file")
         header_len = int.from_bytes(f.read(4), "little")
         f.read(4)                       # reserved
-        xml = f.read(header_len).decode("utf-8", "replace")
+        return f.read(header_len).decode("utf-8", "replace")
 
-    image = re.search(r"<Image[^>]*>", xml)
+
+def _xml_attrs(tag):
+    return dict(re.findall(r'([A-Za-z_:][\w:.-]*)="([^"]*)"', tag))
+
+
+def _xisf_image_spec(path: Path):
+    """Where and how the single image of a monolithic XISF file is stored.
+
+    PixInsight writes masters as an XML header followed by the samples at a byte offset the
+    header states, so a master can be read - or, uncompressed, memory-mapped - without an
+    XISF library. Returns {offset, length, shape, dtype, scale, compression, keywords};
+    `scale` is None for a float image that declares no bounds (see read_xisf).
+    """
+    xml = _xisf_header(path)
+    image = re.search(r"<Image\b[^>]*>", xml)
     if image is None:
         raise ValueError(f"{path.name} contains no Image element")
-    tag = image.group(0)
+    attrs = _xml_attrs(image.group(0))
 
-    def attr(name):
-        m = re.search(name + r'="([^"]*)"', tag)
-        return m.group(1) if m else None
-
-    if attr("compression"):
-        raise ValueError(f"{path.name} uses a compressed XISF block, which is not supported")
-    location = attr("location")
-    m = re.match(r"attachment:(\d+):(\d+)", location or "")
+    m = re.match(r"attachment:(\d+):(\d+)", attrs.get("location", ""))
     if not m:
-        raise ValueError(f"{path.name} does not store its samples as a plain attachment")
-    offset = int(m.group(1))
-    geometry = (attr("geometry") or "").split(":")
+        raise ValueError(f"{path.name} does not store its samples as an attachment")
+    geometry = attrs.get("geometry", "").split(":")
     if len(geometry) < 3 or geometry[2] != "1":
         raise ValueError(f"{path.name} is not a single-channel image")
     width, height = int(geometry[0]), int(geometry[1])
 
-    sample_format = attr("sampleFormat") or ""
+    sample_format = attrs.get("sampleFormat", "")
     dtype = {"Float32": np.float32, "Float64": np.float64,
-             "UInt16": np.uint16, "UInt8": np.uint8}.get(sample_format)
+             "UInt16": np.uint16, "UInt8": np.uint8, "UInt32": np.uint32}.get(sample_format)
     if dtype is None:
         raise ValueError(f"{path.name} has an unsupported sample format {sample_format!r}")
     # Float masters are normalised to the bounds the header declares (PixInsight writes
     # 0:1); integer ones are already in native ADU.
-    bounds = attr("bounds")
     scale = 1.0
-    if bounds and np.issubdtype(dtype, np.floating):
-        lo, hi = (float(v) for v in bounds.split(":"))
-        if hi > lo:
-            scale = 65535.0 / (hi - lo)
-    return offset, (height, width), dtype, scale
+    if np.issubdtype(dtype, np.floating):
+        bounds = attrs.get("bounds")
+        scale = None
+        if bounds:
+            lo, hi = (float(v) for v in bounds.split(":"))
+            scale = 65535.0 / (hi - lo) if hi > lo else None
+
+    keywords = {}
+    for tag in re.findall(r"<FITSKeyword\b[^>]*>", xml):
+        kw = _xml_attrs(tag)
+        if kw.get("name"):
+            keywords[kw["name"].upper()] = kw.get("value", "").strip().strip("'").strip()
+    return {"offset": int(m.group(1)), "length": int(m.group(2)), "shape": (height, width),
+            "dtype": dtype, "scale": scale, "compression": attrs.get("compression"),
+            "keywords": keywords}
+
+
+def _xisf_decompress(raw: bytes, compression: str, name: str) -> bytes:
+    """Undo an XISF block compression: zlib / lz4 / lz4hc / zstd, optionally byte-shuffled.
+
+    zlib is in the standard library; lz4 and zstd need the `lz4` / `zstandard` packages and
+    are refused with a clear message when those are not installed.
+    """
+    parts = compression.split(":")
+    codec, size = parts[0].lower(), int(parts[1])
+    shuffled = codec.endswith("+sh")
+    codec = codec.removesuffix("+sh")
+    if codec == "zlib":
+        import zlib
+        data = zlib.decompress(raw)
+    elif codec in ("lz4", "lz4hc"):
+        try:
+            import lz4.block  # type: ignore[import-not-found]
+        except ImportError:
+            raise ValueError(f"{name} is lz4-compressed; pip install lz4 to read it") from None
+        data = lz4.block.decompress(raw, uncompressed_size=size)
+    elif codec == "zstd":
+        try:
+            import zstandard  # type: ignore[import-not-found]
+        except ImportError:
+            raise ValueError(f"{name} is zstd-compressed; pip install zstandard to read it") from None
+        data = zstandard.ZstdDecompressor().decompress(raw, max_output_size=size)
+    else:
+        raise ValueError(f"{name} uses unsupported XISF compression {codec!r}")
+    if shuffled:
+        item = int(parts[2]) if len(parts) > 2 else 1
+        n = len(data) // item
+        body = np.frombuffer(data, dtype=np.uint8, count=n * item).reshape(item, n).T
+        data = body.tobytes() + data[n * item:]
+    return data
 
 
 def read_xisf(path: Path) -> np.ndarray:
     """One XISF master as float32 in 16-bit ADU, matching the lights' scale."""
-    offset, shape, dtype, scale = _xisf_image_spec(path)
-    data = np.memmap(path, dtype=dtype, mode="r", offset=offset, shape=shape)
-    return np.asarray(data, dtype=np.float32) * np.float32(scale)
+    spec = _xisf_image_spec(path)
+    if spec["compression"]:
+        with open(path, "rb") as f:
+            f.seek(spec["offset"])
+            raw = f.read(spec["length"])
+        data = np.frombuffer(_xisf_decompress(raw, spec["compression"], path.name),
+                             dtype=spec["dtype"]).reshape(spec["shape"])
+    else:
+        data = np.memmap(path, dtype=spec["dtype"], mode="r", offset=spec["offset"],
+                         shape=spec["shape"])
+    # A copy: a float32 memmap would come back as itself - read-only - from asarray.
+    out = np.array(data, dtype=np.float32)
+    scale = spec["scale"]
+    if scale is None:
+        # A float image with no declared bounds. PixInsight always writes them, so this is
+        # another tool's file: read 0..1 data as normalised and anything larger as ADU,
+        # and say so - silently assuming either one is off by a factor of 65535.
+        normalised = float(np.nanmax(out[::8, ::8])) <= 1.5
+        scale = 65535.0 if normalised else 1.0
+        print(f"calibration: WARNING - {path.name} declares no sample bounds; reading it as "
+              f"{'0..1 normalised' if normalised else 'ADU'} data", file=sys.stderr)
+    if scale != 1.0:
+        out *= np.float32(scale)
+    return out
+
+
+def xisf_master_settings(path: Path):
+    """Settings of an XISF master, from its FITS keywords and failing that its file name."""
+    settings = _settings_from_name(path.name)
+    try:
+        keywords = _xisf_image_spec(path)["keywords"]
+    except (OSError, ValueError):
+        return settings
+    settings.update(frame_settings(keywords))
+    return settings
 
 
 def master(path):
@@ -450,14 +765,20 @@ def session_dir_of(path: Path, marker: str):
     return None
 
 
-def scan_flat_dirs(root: Path):
-    """{(session, filter): [flat files]} - flats are taken per session and per filter.
+def _is_darkflat_dir(name):
+    return re.sub(r"[^A-Z]", "", name.upper()) in DARKFLAT_DIR_NAMES
 
-    The filter is the folder above FLAT (".../<session>/<whatever>/<filter>/FLAT/<exp>/"),
-    which is how the capture software lays them out, and the session is the top-level
-    folder, so a night's flats only ever calibrate that night's lights.
+
+def scan_flat_dirs(root: Path):
+    """({(session, filter): [flat files]}, {darkflat folder: [files]}).
+
+    Flats are taken per session and per filter. The filter is the folder above FLAT
+    (".../<session>/<whatever>/<filter>/FLAT/<exp>/"), which is how the capture software
+    lays them out, and the session is three levels above that, so a night's flats only
+    ever calibrate that night's lights. Dark flats are collected by folder name and matched
+    to sessions afterwards (see _darkflat_sessions), since tools put them at varying depths.
     """
-    found = {}
+    found, darkflats = {}, {}
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames
                        if d not in EXCLUDED_DIR_NAMES and not d.startswith(".")]
@@ -465,6 +786,14 @@ def scan_flat_dirs(root: Path):
         try:
             parts = directory.relative_to(root).parts
         except ValueError:
+            continue
+        files = [directory / n for n in filenames if Path(n).suffix.lower() in FITS_EXTS]
+        if not files:
+            continue
+        darkflat_at = [i for i, p in enumerate(parts) if _is_darkflat_dir(p)]
+        if darkflat_at:
+            folder = root.joinpath(*parts[:darkflat_at[0] + 1])
+            darkflats.setdefault(folder, []).extend(files)
             continue
         upper = [p.upper() for p in parts]
         if FLAT_DIR_NAME not in upper:
@@ -475,40 +804,112 @@ def scan_flat_dirs(root: Path):
         session = session_dir_of(directory / "x", FLAT_DIR_NAME)
         if session is None:
             continue
-        key = (str(session), parts[i - 1])
-        files = [directory / n for n in filenames if Path(n).suffix.lower() in FITS_EXTS]
-        if files:
-            found.setdefault(key, []).extend(files)
-    return {k: sorted(v) for k, v in sorted(found.items())}
+        # Upper-cased, as organize_flats.py compares them: a "Ha" folder and an "HA" FILTER
+        # card are one filter, and calibration_plan() folds case the same way.
+        found.setdefault((str(session), parts[i - 1].upper()), []).extend(files)
+    return ({k: sorted(v) for k, v in sorted(found.items())},
+            {k: sorted(v) for k, v in sorted(darkflats.items())})
 
 
-def _build_master_flat(files, bias, limit=40):
+def _darkflat_sessions(darkflats, sessions):
+    """{session or "": [files]}: each dark-flat folder goes to the flat session it sits in,
+    or to "" - usable by every session - when it sits in none of them."""
+    out = {}
+    for folder, files in darkflats.items():
+        owners = [s for s in sessions if Path(s) in folder.parents or Path(s) == folder]
+        key = max(owners, key=len) if owners else ""
+        out.setdefault(key, []).extend(files)
+    return out
+
+
+def _read_frame(path):
+    """(float32 data, header) of one calibration frame."""
+    with fits.open(str(path), memmap=False) as hdul:
+        hdu = first_image_hdu(hdul)
+        return np.asarray(hdu.data, dtype=np.float32), hdu.header.copy()
+
+
+def _majority_settings(files, label):
+    """The files sharing the most common gain/binning, and a warning for any left out.
+
+    A flat set mixing gains or binnings would median-combine frames that do not share a
+    pattern (and, across binnings, not even a shape), so only the larger group is used.
+    """
+    groups = {}
+    for path in files:
+        try:
+            s = frame_settings(fits.getheader(str(path)))
+        except OSError:
+            continue
+        key = (s.get("gain"), s.get("binning"))
+        groups.setdefault(key, []).append(path)
+    if len(groups) <= 1:
+        return files, None
+    best = max(groups.values(), key=len)
+    dropped = len(files) - len(best)
+    return best, (f"{label}: flats mix {len(groups)} gain/binning settings; "
+                  f"using the {len(best)} that agree, ignoring {dropped}")
+
+
+def _darkflat_groups(files):
+    """{exposure: [dark-flat files]} - one master per distinct exposure."""
+    by_exposure = {}
+    for path in files:
+        try:
+            header = fits.getheader(str(path))
+        except OSError:
+            continue
+        exp = _number(header.get("EXPTIME", header.get("EXPOSURE")))
+        if exp is not None:
+            by_exposure.setdefault(round(exp, 3), []).append(path)
+    return dict(sorted(by_exposure.items()))
+
+
+def _combine_darkflats(paths, limit=30):
+    stack = np.stack([_read_frame(p)[0] for p in paths[:limit]])
+    return np.median(stack, axis=0, overwrite_input=True)
+
+
+def _build_master_flat(files, bias, darkflats=(), limit=40):
     """Normalised flat field from one session+filter's flats.
 
-    Each frame is bias-subtracted and divided by its own median before they are combined,
-    because these are shot to a target level rather than a fixed exposure - one set here
-    spans 0.85 s to 0.99 s - and combining them raw would weight the brighter ones.
+    Each frame has its dark flat - or, without one, the bias - subtracted and is divided by
+    its own median before they are combined, because these are shot to a target level
+    rather than a fixed exposure - one set here spans 0.85 s to 0.99 s - and combining them
+    raw would weight the brighter ones. Frames are read on a few threads: on a first run
+    building the masters is minutes of disk reads, which the combine itself never was.
     """
     step = max(1, len(files) // limit)
     chosen = files[::step][:limit]
-    # Read straight into one preallocated cube rather than building a list and then
-    # stacking it, which held two full copies at once - about 2.2 GB for thirty 9 Mpx
-    # flats. overwrite_input lets the median reuse the cube instead of copying it again.
-    cube = None
-    used = 0
-    for path in chosen:
-        with fits.open(str(path), memmap=False) as hdul:
-            frame = np.asarray(first_image_hdu(hdul).data, dtype=np.float32)
-        if bias is not None and bias.shape == frame.shape:
-            frame = frame - bias
-        level = float(np.median(frame))
-        if level <= 0:
-            continue
-        if cube is None:
-            cube = np.empty((len(chosen),) + frame.shape, dtype=np.float32)
-        cube[used] = frame
-        cube[used] /= level
-        used += 1
+
+    def load(path):
+        frame, header = _read_frame(path)
+        exp = _number(header.get("EXPTIME", header.get("EXPOSURE")))
+        pedestal = bias
+        if darkflats and exp is not None:
+            exp_df, df = min(darkflats, key=lambda d: abs(d[0] - exp))
+            if abs(exp_df - exp) <= DARKFLAT_EXPOSURE_TOLERANCE * max(exp, 1e-6) \
+                    and df.shape == frame.shape:
+                pedestal = df
+        if pedestal is not None and pedestal.shape == frame.shape:
+            frame -= pedestal
+        level = float(np.median(frame[::2, ::2]))
+        return (frame / level) if level > 0 else None
+
+    # Filled one frame at a time as reads complete, into one preallocated cube rather than
+    # a list that is then stacked - which held two full copies at once, about 2.2 GB for
+    # thirty 9 Mpx flats. overwrite_input lets the median reuse the cube as well.
+    cube, used = None, 0
+    with ThreadPoolExecutor(max_workers=MASTER_FLAT_READ_THREADS) as pool:
+        for frame in pool.map(load, chosen):
+            if frame is None:
+                continue
+            if cube is None:
+                cube = np.empty((len(chosen),) + frame.shape, dtype=np.float32)
+            if frame.shape != cube.shape[1:]:
+                continue
+            cube[used] = frame
+            used += 1
     if cube is None or used == 0:
         return None
     combined = np.median(cube[:used], axis=0, overwrite_input=True)
@@ -522,36 +923,57 @@ def _build_master_flat(files, bias, limit=40):
     return combined
 
 
+def _fingerprint(paths):
+    """Identity of a master's inputs, so a changed input rebuilds it.
+
+    Reusing a cached master purely because the file existed meant that shooting more
+    flats for a session and rescanning silently kept the old one - the very kind of stale
+    calibration that is invisible in the output.
+    """
+    h = hashlib.sha1()
+    for q in sorted(paths):
+        st_ = Path(q).stat()
+        h.update(f"{q}|{st_.st_mtime_ns}|{st_.st_size}|".encode())
+    return h.hexdigest()[:10]
+
+
+def _name_tag(*parts):
+    """A readable, collision-free file-name fragment: "night 1" and "night_1" both read
+    as night_1, so a hash of the exact inputs keeps them apart."""
+    readable = "_".join(re.sub(r"[^A-Za-z0-9]+", "_", str(p)) for p in parts)
+    return readable + "_" + hashlib.sha1("|".join(map(str, parts)).encode()).hexdigest()[:6]
+
+
 def prepare_calibration(root: Path, darks_dir, progress=True, calibrated_dir=None):
     """Build every master the scan will need, once, and return a picklable manifest.
 
-    Returns {"root", "bias", "darks": {exposure: path}, "flats": {(session, filter): path}}
-    naming .npy files the workers memory-map. None if there is nothing to calibrate with.
+    Returns {"root", "biases": [{path, settings, level}], "darks": [{path, exposure,
+    settings}], "flats": {(session, filter): {path, settings}}, ...} naming .npy files the
+    workers memory-map. None if there is nothing to calibrate with.
     """
     darks_dir = Path(darks_dir).expanduser().resolve() if darks_dir else None
-    flat_sets = scan_flat_dirs(root)
-    if darks_dir is None and not flat_sets:
+    if darks_dir is not None and not darks_dir.is_dir():
+        # A mistyped --darks used to glob an empty list and carry on, so the whole scan ran
+        # bias-free with nothing on the terminal to say why.
+        print(f"calibration: WARNING - darks folder {darks_dir} does not exist; "
+              f"no master bias or darks will be applied", file=sys.stderr)
+        darks_dir = None
+    flat_sets, darkflat_dirs = scan_flat_dirs(root)
+    cache = root / CALIB_DIRNAME
+    # Without --darks the cache's own bias/darks from an earlier run are reused below, so
+    # only give up when there is neither anything new to build nor anything cached.
+    if darks_dir is None and not flat_sets and not any(cache.glob("*.npy")):
         return None
 
-    cache = root / CALIB_DIRNAME
     cache.mkdir(exist_ok=True)
-    manifest = {"root": str(root), "bias": None, "darks": {}, "flats": {},
+    manifest = {"root": str(root), "biases": [], "darks": [], "flats": {},
                 "calibrated_dir": str(calibrated_dir) if calibrated_dir else None}
-
+    index_path = cache / CALIB_INDEX_NAME
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        index = {}
     built = [0]
-
-    def fingerprint(paths):
-        """Identity of a master's inputs, so a changed input rebuilds it.
-
-        Reusing a cached master purely because the file existed meant that shooting more
-        flats for a session and rescanning silently kept the old one - the very kind of
-        stale calibration that is invisible in the output.
-        """
-        h = hashlib.sha1()
-        for q in sorted(paths):
-            st_ = Path(q).stat()
-            h.update(f"{q}|{st_.st_mtime_ns}|{st_.st_size}|".encode())
-        return h.hexdigest()[:10]
 
     def store(name, build, label=None):
         out = cache / name
@@ -566,82 +988,266 @@ def prepare_calibration(root: Path, darks_dir, progress=True, calibrated_dir=Non
                 if progress and label:
                     print(" - skipped", file=sys.stderr)
                 return None
-            np.save(out, np.ascontiguousarray(arr, dtype=np.float32))
+            # Via a temp name: a master is reused purely because its file exists, so one
+            # cut short by Ctrl+C or a full disk would otherwise be loaded on every later run.
+            # The temp name keeps the .npy suffix, or np.save would append a second one.
+            tmp = out.with_name(out.stem + ".part.npy")
+            np.save(tmp, np.ascontiguousarray(arr, dtype=np.float32))
+            os.replace(tmp, out)
             built[0] += 1
             if progress and label:
                 print(f" - {time.time() - t0:.1f}s", file=sys.stderr)
         return str(out)
 
-    bias = None
     if darks_dir is not None:
-        candidates = sorted(darks_dir.glob("masterBias*.xisf"))[:1] + \
-            sorted(darks_dir.glob("masterDark*.xisf"))
+        bias_files = sorted(darks_dir.glob("masterBias*.xisf"))
+        dark_files = sorted(darks_dir.glob("masterDark*.xisf"))
+        candidates = bias_files + dark_files
         if progress:
             print(f"calibration: {len(candidates)} masters from {darks_dir}", file=sys.stderr)
         for n, candidate in enumerate(candidates, 1):
             m = re.search(r"EXPOSURE-([0-9.]+)s", candidate.name, re.IGNORECASE)
-            label = f"[{n}/{len(candidates)}] {'dark ' + m.group(1) + 's' if m else 'bias'}"
-            stamp = fingerprint([candidate])
-            if m is None:
-                manifest["bias"] = store(f"bias-{stamp}.npy",
-                                         lambda c=candidate: read_xisf(c), label)
-                if manifest["bias"]:
-                    bias = np.load(manifest["bias"], mmap_mode="r")
+            settings = xisf_master_settings(candidate)
+            exposure = float(m.group(1)) if m else None
+            if candidate in dark_files and exposure is None:
+                keyword_exp = _number(_xisf_image_spec(candidate)["keywords"].get("EXPTIME"))
+                exposure = keyword_exp
+            is_bias = candidate in bias_files
+            if not is_bias and exposure is None:
+                print(f"calibration: {candidate.name} names no exposure; ignored",
+                      file=sys.stderr)
                 continue
-            exposure = float(m.group(1))
-            path = store(f"dark_{exposure:g}s-{stamp}.npy",
-                         lambda c=candidate: read_xisf(c), label)
-            if path:
-                manifest["darks"][exposure] = path
+            label = f"[{n}/{len(candidates)}] {'bias' if is_bias else f'dark {exposure:g}s'}"
+            stamp = _fingerprint([candidate])
+            name = (f"bias-{stamp}.npy" if is_bias else f"dark_{exposure:g}s-{stamp}.npy")
+            path = store(name, lambda c=candidate: read_xisf(c), label)
+            if not path:
+                continue
+            entry = {"path": path, "settings": settings, "source": candidate.name}
+            if is_bias:
+                entry["level"] = bias_level(master(path))
+                manifest["biases"].append(entry)
+            else:
+                entry["exposure"] = exposure
+                manifest["darks"].append(entry)
+        if len(manifest["biases"]) > 1 and progress:
+            print(f"calibration: {len(manifest['biases'])} master biases; each light gets "
+                  f"the one matching its gain/offset/binning", file=sys.stderr)
         if progress:
-            print(f"calibration: {len(manifest['darks'])} master darks"
-                  f"{' + bias' if manifest['bias'] else ''} ready", file=sys.stderr)
+            print(f"calibration: {len(manifest['darks'])} master darks + "
+                  f"{len(manifest['biases'])} bias ready", file=sys.stderr)
     else:
-        # No raw XISF masters given: reuse whatever bias/dark .npy the cache already
-        # holds from a previous run, instead of silently calibrating with neither.
-        bias_candidates = sorted(cache.glob("bias-*.npy"))
-        if bias_candidates:
-            manifest["bias"] = str(bias_candidates[-1])
-            bias = np.load(manifest["bias"], mmap_mode="r")
-        for dark_path in sorted(cache.glob("dark_*s-*.npy")):
-            m = re.search(r"dark_([0-9.]+)s-", dark_path.name)
-            if m:
-                manifest["darks"][float(m.group(1))] = str(dark_path)
-        if progress and (manifest["bias"] or manifest["darks"]):
-            print(f"calibration: reusing {len(manifest['darks'])} cached master darks"
-                  f"{' + bias' if manifest['bias'] else ''} from {cache}", file=sys.stderr)
+        # No raw XISF masters given: reuse whatever bias/dark .npy the cache already holds
+        # from a previous run, instead of silently calibrating with neither. The index says
+        # what each one is; without it (an older cache) only the newest bias is trusted.
+        # Oldest first, so the newest master wins. The names end in a content hash, so
+        # sorting by name picked an arbitrary one once a master had been rebuilt.
+        def by_age(pattern):
+            return sorted(cache.glob(pattern), key=lambda q: q.stat().st_mtime)
+
+        for kind, pattern in (("bias", "bias-*.npy"), ("dark", "dark_*s-*.npy")):
+            for q in by_age(pattern):
+                info = index.get(q.name)
+                m = re.search(r"dark_([0-9.]+)s-", q.name)
+                entry = {"path": str(q), "settings": (info or {}).get("settings", {}),
+                         "source": (info or {}).get("source", q.name)}
+                if kind == "bias":
+                    entry["level"] = (info or {}).get("level") or bias_level(master(str(q)))
+                    if info is None:
+                        manifest["biases"] = []     # unindexed: newest one only
+                    manifest["biases"].append(entry)
+                elif m:
+                    entry["exposure"] = float(m.group(1))
+                    manifest["darks"].append(entry)
+        if progress and (manifest["biases"] or manifest["darks"]):
+            print(f"calibration: reusing {len(manifest['darks'])} cached master darks + "
+                  f"{len(manifest['biases'])} bias from {cache}", file=sys.stderr)
+
+    # The bias used for flats, and the default pedestal for frames that match none.
+    bias = master(manifest["biases"][-1]["path"]) if manifest["biases"] else None
+    manifest["bias_level"] = manifest["biases"][-1]["level"] if manifest["biases"] else None
+
+    darkflats_by_session = _darkflat_sessions(darkflat_dirs, {s for s, _f in flat_sets})
+    master_darkflats = {}
+    for session, files in darkflats_by_session.items():
+        built_df = []
+        for exp, group in _darkflat_groups(files).items():
+            name = (f"darkflat_{_name_tag(Path(session).name or 'all', exp)}"
+                    f"-{_fingerprint(group)}.npy")
+            path = store(name, lambda g=group: _combine_darkflats(g))
+            if path:
+                built_df.append((exp, master(path)))
+                manifest.setdefault("darkflats", []).append(path)
+        master_darkflats[session] = built_df
+        if progress and built_df:
+            print(f"calibration: {len(built_df)} master dark flat(s) for "
+                  f"{Path(session).name or 'every session'}", file=sys.stderr)
 
     if progress and flat_sets:
-        if bias is None:
+        if bias is None and not master_darkflats:
             # The pedestal is part of every flat, so leaving it in flattens the measured
             # vignetting profile. Worth saying out loud rather than quietly going ahead.
-            print("calibration: WARNING - no master bias, so flats keep their pedestal "
-                  "and the vignetting they model will be understated", file=sys.stderr)
+            print("calibration: WARNING - no master bias or dark flats, so flats keep their "
+                  "pedestal and the vignetting they model will be understated", file=sys.stderr)
         print(f"calibration: {len(flat_sets)} master flats to prepare "
               f"(one per session and filter)", file=sys.stderr)
     for n, ((session, filt), files) in enumerate(flat_sets.items(), 1):
-        tag = re.sub(r"[^A-Za-z0-9]+", "_", Path(session).name)
         label = f"[{n}/{len(flat_sets)}] flat {Path(session).name} / {filt} ({len(files)} frames)"
-        path = store(f"flat_{tag}_{filt}-{fingerprint(files)}.npy",
-                     lambda f=files: _build_master_flat(f, bias), label)
+        files, warning = _majority_settings(files, f"{Path(session).name} / {filt}")
+        if warning:
+            print(f"calibration: WARNING - {warning}", file=sys.stderr)
+        darkflats = master_darkflats.get(session, []) + master_darkflats.get("", [])
+        try:
+            settings = frame_settings(fits.getheader(str(files[0])))
+        except OSError:
+            settings = {}
+        # The bias these flats were shot at: with masters for several gains, the default
+        # one can carry another gain's pedestal entirely.
+        flat_bias = next((master(b["path"]) for b in reversed(manifest["biases"])
+                          if not settings_conflicts(b["settings"], settings)), None)
+        path = store(f"flat_{_name_tag(Path(session).name, filt)}-"
+                     f"{_fingerprint(files)}{'' if flat_bias is None else 'b'}.npy",
+                     lambda f=files, d=darkflats, b=flat_bias: _build_master_flat(f, b, d),
+                     label)
         if path:
-            manifest["flats"][(session, filt)] = path
-    used = [manifest["bias"]] + list(manifest["darks"].values()) + list(manifest["flats"].values())
-    manifest["masters_mtime"] = max(
-        (Path(q).stat().st_mtime for q in used if q), default=0.0)
+            manifest["flats"][(session, filt)] = {"path": path, "settings": settings}
+
+    used = ([b["path"] for b in manifest["biases"]] + [d["path"] for d in manifest["darks"]]
+            + [f["path"] for f in manifest["flats"].values()] + manifest.get("darkflats", []))
+    manifest["masters_mtime"] = max((Path(q).stat().st_mtime for q in used), default=0.0)
+    prune_calibration_cache(cache, used, progress)
+    new_index = {Path(e["path"]).name: {k: e.get(k) for k in ("settings", "level", "source",
+                                                                "exposure")}
+                 for e in manifest["biases"] + manifest["darks"]}
+    write_json_atomic(index_path, new_index)
     if progress:
         print(f"calibration: {len(manifest['darks'])} darks + {len(manifest['flats'])} flats "
               f"ready ({built[0]} built, rest reused) in {cache}", file=sys.stderr)
     return manifest
 
 
-def write_calibrated(manifest, path: Path, data, header, calibration):
+def bias_level(bias):
+    """The master bias' pedestal in ADU, for estimating sky signal where no dark or bias
+    could be subtracted. A strided median: the pedestal is flat to a fraction of an ADU."""
+    return float(np.median(np.asarray(bias[::4, ::4], dtype=np.float32)))
+
+
+def master_bias_level(darks_dir):
+    """bias_level() straight from the masterBias XISF, for runs that do not calibrate."""
+    darks_dir = Path(darks_dir).expanduser() if darks_dir else None
+    if darks_dir is None or not darks_dir.is_dir():
+        return None
+    for candidate in sorted(darks_dir.glob("masterBias*.xisf"))[:1]:
+        try:
+            return bias_level(read_xisf(candidate))
+        except (OSError, ValueError) as e:
+            print(f"calibration: cannot read {candidate.name} for the bias level ({e})",
+                  file=sys.stderr)
+    return None
+
+
+# Everything prepare_calibration() writes. Only these are ever pruned from the cache.
+_CACHE_FILE_PATTERNS = ("bias-*.npy", "dark_*s-*.npy", "flat_*-*.npy", "darkflat_*-*.npy",
+                        "*.part.npy")
+
+
+def prune_calibration_cache(cache: Path, used, progress=True):
+    """Delete cached masters this run did not use.
+
+    Every rebuilt master flat gets a new name (its inputs' fingerprint is part of it), so
+    without this the old one stayed behind forever - ~36 MB per full-size frame, per
+    session and filter, per rescan after new flats. Anything removed is rebuilt from the
+    source frames if it is ever needed again. Only files matching the names this module
+    writes are touched.
+    """
+    keep = {Path(q).resolve() for q in used if q}
+    freed, removed = 0, 0
+    for pattern in _CACHE_FILE_PATTERNS:
+        for stale in cache.glob(pattern):
+            if stale.resolve() in keep:
+                continue
+            try:
+                size = stale.stat().st_size
+                stale.unlink()
+            except OSError:
+                continue
+            freed += size
+            removed += 1
+    if progress and removed:
+        print(f"calibration: removed {removed} unused cached master(s), "
+              f"{freed / 1e6:.0f} MB freed", file=sys.stderr)
+
+
+def calibration_plan(manifest, path: Path, exposure, filt, settings):
+    """Which masters calibrate one light frame - paths only, nothing loaded.
+
+    Returns {dark, flat, label, pedestal, warnings}. Pure data from the manifest and the
+    frame's own exposure/filter/settings, so the parent can work out whether a cached row
+    was measured against the same masters without opening the file again.
+
+    The dark has to match the exposure exactly - an interpolated one would invent dark
+    current that was never measured - and falls back to the bias, which is the part of the
+    pedestal that does not depend on exposure at all. Either has to agree with the frame on
+    gain, offset and binning where both say: a dark at another gain carries another
+    pattern, and subtracting it is worse than subtracting none.
+    """
+    plan = {"dark": None, "flat": None, "label": "", "pedestal": None, "warnings": []}
+    if not manifest:
+        return plan
+    warnings = plan["warnings"]
+    parts = []
+
+    exp = _number(exposure)
+    if exp is not None:
+        same_exp = [d for d in manifest["darks"] if abs(d["exposure"] - exp) < 1e-6 * max(1.0, exp)]
+        matching = [d for d in same_exp if not settings_conflicts(d["settings"], settings)]
+        if same_exp and not matching:
+            warnings.append(f"dark {exp:g}s not used: "
+                            + "; ".join(settings_conflicts(same_exp[0]["settings"], settings)))
+        if matching:
+            best = min(matching, key=lambda d: _temp_gap(d["settings"], settings) or 0.0)
+            gap = _temp_gap(best["settings"], settings)
+            if gap is not None and gap > DARK_TEMP_TOLERANCE_C:
+                warnings.append(f"dark {exp:g}s is {gap:.1f}\N{DEGREE SIGN}C off the frame's "
+                                f"sensor temperature")
+            plan["dark"] = best["path"]
+            parts.append(f"dark {exp:g}s")
+
+    biases = manifest.get("biases", [])
+    good_bias = [b for b in biases if not settings_conflicts(b["settings"], settings)]
+    if biases and not good_bias:
+        warnings.append("bias not used: " + "; ".join(settings_conflicts(biases[0]["settings"],
+                                                                          settings)))
+    if good_bias:
+        plan["pedestal"] = good_bias[-1].get("level")
+        if plan["dark"] is None:
+            plan["dark"] = good_bias[-1]["path"]
+            parts.append("bias")
+
+    session = session_dir_of(path, LIGHT_DIR_NAME)
+    flat = manifest["flats"].get((str(session) if session else "", (filt or "").strip().upper()))
+    if flat:
+        conflict = [c for c in settings_conflicts(flat["settings"], settings)
+                    if c.startswith("binning")]
+        if conflict:
+            warnings.append("flat not used: " + conflict[0])
+        else:
+            plan["flat"] = flat["path"]
+            parts.append("flat")
+
+    plan["label"] = " + ".join(parts)
+    return plan
+
+
+def write_calibrated(manifest, path: Path, data, header, calibration, signature):
     """Save the calibrated frame, mirroring its place in the source tree.
 
     float32 and not uint16: dark subtraction leaves genuine negative pixels wherever the
     sky sat below the pedestal, and rounding those away is exactly the information a
-    stacker needs to weight the frame. An existing file is left alone, so re-running the
-    scan does not rewrite gigabytes that have not changed.
+    stacker needs to weight the frame. An existing file is left alone only when its CALSIG
+    card says it came from this very source file and these very masters - an mtime check
+    kept stale copies whenever the masters changed in any way other than getting newer
+    (a flat that stopped applying, a different dark) or the light itself was replaced.
     """
     out_root = manifest.get("calibrated_dir") if manifest else None
     if not out_root or not calibration:
@@ -652,11 +1258,12 @@ def write_calibrated(manifest, path: Path, data, header, calibration):
     except ValueError:
         relative = Path(path.name)
     out = Path(out_root) / relative
-    # Rewritten when the masters that produced it are newer, so rebuilding a master flat
-    # does not leave the frames on disk calibrated against the previous one while the
-    # measurements in the report came from the new one.
-    if out.exists() and out.stat().st_mtime >= manifest.get("masters_mtime", 0):
-        return str(out)
+    if out.exists():
+        try:
+            if fits.getheader(str(out)).get("CALSIG") == signature:
+                return str(out)
+        except OSError:
+            pass
     out.parent.mkdir(parents=True, exist_ok=True)
 
     head = header.copy()
@@ -667,42 +1274,13 @@ def write_calibrated(manifest, path: Path, data, header, calibration):
     head["CALSTAT"] = (("D" if "dark" in calibration or "bias" in calibration else "")
                        + ("F" if "flat" in calibration else ""),
                        "calibration applied: D=dark/bias, F=flat")
+    head["CALSIG"] = (signature, "source + masters this was calibrated from")
     head.add_history(f"calibrated by fits_light_stats: {calibration}")
     tmp = out.with_suffix(out.suffix + ".part")
     fits.PrimaryHDU(np.ascontiguousarray(data, dtype=np.float32), header=head).writeto(
         tmp, overwrite=True)
     os.replace(tmp, out)     # never leave a half-written frame behind under the real name
     return str(out)
-
-
-def calibration_for(manifest, path: Path, exposure, filt):
-    """(dark, flat, label) for one light frame, or (None, None, "") without calibration.
-
-    The dark has to match the exposure exactly - an interpolated one would invent dark
-    current that was never measured - and falls back to the bias, which is the part of the
-    pedestal that does not depend on exposure at all.
-    """
-    if not manifest:
-        return None, None, ""
-    parts = []
-
-    dark = None
-    dark_path = manifest["darks"].get(float(exposure)) if isinstance(exposure, (int, float)) else None
-    if dark_path:
-        dark = master(dark_path)
-        parts.append(f"dark {float(exposure):g}s")
-    elif manifest["bias"]:
-        dark = master(manifest["bias"])
-        parts.append("bias")
-
-    flat = None
-    session = session_dir_of(path, LIGHT_DIR_NAME)
-    flat_path = manifest["flats"].get((str(session) if session else "", (filt or "").strip()))
-    if flat_path:
-        flat = master(flat_path)
-        parts.append("flat")
-
-    return dark, flat, " + ".join(parts)
 
 
 def first_image_hdu(hdul) -> Any:
@@ -864,7 +1442,7 @@ def _compact_source_mask(segm):
     # here - so read them off it instead of running a second find_objects and a second
     # full-frame bincount, which together cost about as much as the mask itself.
     linear = [
-        lab for lab, sl, area in zip(segm.labels, segm.slices, segm.areas)
+        lab for lab, sl, area in zip(segm.labels, segm.slices, segm.areas, strict=True)
         if max(sl[0].stop - sl[0].start, sl[1].stop - sl[1].start) >= TRAIL_LINEAR_MIN_EXTENT_PX
         and area / float((sl[0].stop - sl[0].start) * (sl[1].stop - sl[1].start))
         <= TRAIL_LINEAR_MAX_FILL
@@ -1283,7 +1861,7 @@ def _fit_psfs(data_sub, segm, labels, xs, ys):
     return fwhm, roundness, orientation, ok
 
 
-def detect_star_metrics(flat, noise, h, w, saturated_idx=None):
+def detect_star_metrics(flat, noise, h, w, saturated_idx=None, saturation=SATURATION_ADU):
     """Detect stars in a background-flattened frame and return (hfr, fwhm, roundness, trail,
     elongation). Roundness is minor/major axis ratio: 1.0 = perfectly round, lower = more
     elongated. trail is find_trail's geometry for a satellite trail, or None.
@@ -1327,7 +1905,7 @@ def detect_star_metrics(flat, noise, h, w, saturated_idx=None):
     keep = edge_ok & ~saturated & ~hot_pixel & np.isfinite(fwhm_conv) & \
         (fwhm_conv > 0.3) & (fwhm_conv < 30.0)
     if saturated_idx is None:
-        keep &= maxv < SATURATION_ADU      # no raw mask given: best effort on calibrated data
+        keep &= maxv < saturation      # no raw mask given: best effort on calibrated data
     if not keep.any():
         return [], [], [], find_trail(flat, noise, segm), None
 
@@ -1388,7 +1966,55 @@ def detect_star_metrics(flat, noise, h, w, saturated_idx=None):
     return hfr.tolist(), fwhm_final.tolist(), roundness_final.tolist(), trail, elong
 
 
-def process_file(path: Path, calib=None, solver=None):
+def frame_full_scale(header, override=None):
+    """The ADU a pixel reads when it is full: --full-scale if given, else the SATURATE card,
+    else the sensor's integer range (255 for 8-bit data, 65535 otherwise).
+
+    DATAMAX is deliberately not used: plenty of software writes it as the brightest pixel
+    actually present, which would mark every frame's brightest star as clipped.
+    """
+    if override:
+        return float(override)
+    saturate = _number(header.get("SATURATE"))
+    if saturate is not None and saturate >= 255:
+        return saturate
+    return 255.0 if header.get("BITPIX") == 8 else 65535.0
+
+
+def frame_pixel_scale(header):
+    """arcsec per pixel from the optics cards, or None."""
+    pixel_um = _number(header.get("XPIXSZ", header.get("PIXSIZE1")))
+    focal_mm = _number(header.get("FOCALLEN"))
+    binning = _number(header.get("XBINNING")) or 1.0
+    if not pixel_um or not focal_mm or focal_mm <= 0:
+        return None
+    return 206.265 * pixel_um * binning / focal_mm
+
+
+def frame_signature(plan, opts):
+    """What a row was measured against: the masters that calibrated it and every option
+    that changes a measured number. Together with an unchanged file (source_stat) a cached
+    row whose signature still matches would come out identical if measured again."""
+    opts = opts or {}
+    parts = [MEASURE_VERSION, plan.get("dark"), plan.get("flat"),
+             plan.get("pedestal"), opts.get("pedestal"), opts.get("full_scale")]
+    return hashlib.sha1(json.dumps(parts, default=str).encode()).hexdigest()[:16]
+
+
+def _stat_of(path: Path):
+    st = path.stat()
+    return [st.st_mtime_ns, st.st_size]
+
+
+def process_file(path: Path, calib=None, opts=None):
+    """Measure one frame.
+
+    opts: {"pedestal": bias level in ADU to take the sky signal against when no dark or
+    bias ends up subtracted (BIAS_ADU if not given), "full_scale": the sensor's full-scale
+    ADU, overriding what the header says}.
+    """
+    opts = opts or {}
+    source_stat = _stat_of(path)
     # One open for both header and data: getdata()+getheader() parsed the file twice.
     with fits.open(str(path), memmap=False) as hdul:
         hdu = first_image_hdu(hdul)
@@ -1407,8 +2033,11 @@ def process_file(path: Path, calib=None, solver=None):
     adu_mean = float(raw.mean(dtype=np.float64))
     exposure = header.get("EXPOSURE", header.get("EXPTIME"))
     filt = str(header.get("FILTER", "")).strip()
+    settings = frame_settings(header)
+    full_scale = frame_full_scale(header, opts.get("full_scale"))
+    saturation = SATURATION_FRAC * full_scale
     # Clipped pixels are only recognisable as such before calibration rescales them.
-    saturated_idx = np.flatnonzero(raw >= SATURATION_ADU)
+    saturated_idx = np.flatnonzero(raw >= saturation)
 
     # float32 for the measurement pipeline: every step below (sigma clipping, block
     # medians, convolution, segmentation) is memory-bandwidth bound on a ~9 Mpx frame,
@@ -1417,32 +2046,45 @@ def process_file(path: Path, calib=None, solver=None):
     data = raw.astype(np.float32)
     del raw
 
-    # Solved before calibration touches anything: ASTAP reads the frame from disk, and
-    # with --write-wcs it appends to that same file's header.
-    solved = solve_frame(solver, path, header, h)
-
-    dark, flat_field, calibration = calibration_for(calib, path, exposure, filt)
+    plan = calibration_plan(calib, path, exposure, filt, settings)
+    warnings = list(plan["warnings"])
+    dark = master(plan["dark"]) if plan["dark"] else None
+    flat_field = master(plan["flat"]) if plan["flat"] else None
+    calibration = plan["label"]
     dark_ok = dark is not None and dark.shape == data.shape
     flat_ok = flat_field is not None and flat_field.shape == data.shape
+    pedestal = plan["pedestal"] if plan["pedestal"] is not None else opts.get("pedestal")
     if dark_ok:
         data -= dark
+    elif flat_ok:
+        # A flat divides signal, not the sensor's offset. Dividing a light that still
+        # carries its ~2800 ADU pedestal imprinted the vignetting onto the pedestal - a
+        # fake gradient of hundreds of ADU, which hid faint trails - so without a dark or
+        # bias the nominal pedestal comes off first.
+        nominal = pedestal if pedestal is not None else BIAS_ADU
+        data -= np.float32(nominal)
+        warnings.append(f"flat applied without a master bias; a nominal {nominal:.0f} ADU "
+                        f"pedestal was subtracted first")
     if flat_ok:
         data /= flat_field
     # A master that does not match the frame's size is skipped above; the label has to say
     # so, or the report claims a calibration that never happened.
     if (dark is not None and not dark_ok) or (flat_field is not None and not flat_ok):
+        warnings.append("a master's size does not match the frame; skipped")
         calibration = " + ".join(
             part for part in calibration.split(" + ")
             if (part == "flat" and flat_ok) or (part != "flat" and dark_ok))
+    signature = frame_signature(plan, opts)
     # Saved before any measurement touches the array: what lands on disk is the calibrated
     # frame, not the background-subtracted one the metrics are taken from.
-    calibrated_path = write_calibrated(calib, path, data, header, calibration)
-    if dark_ok:
+    calibrated_path = write_calibrated(calib, path, data, header, calibration, hashlib.sha1(
+        f"{signature}-{source_stat[0]}-{source_stat[1]}".encode()).hexdigest()[:20])
+    if dark_ok or flat_ok:
         # The pedestal is gone, so what is left is the sky signal itself rather than an
         # estimate made by subtracting a nominal bias.
         signal_adu = float(data.mean(dtype=np.float64))
     else:
-        signal_adu = adu_mean - BIAS_ADU
+        signal_adu = adu_mean - (pedestal if pedestal is not None else BIAS_ADU)
     signal_adu_per_sec = (
         signal_adu / exposure
         if isinstance(exposure, (int, float)) and exposure > 0
@@ -1459,7 +2101,8 @@ def process_file(path: Path, calib=None, solver=None):
     flat = _flatten_background(data)
     del data
     noise = _flat_noise(flat)
-    hfrs, fwhms, roundnesses, trail, elong = detect_star_metrics(flat, noise, h, w, saturated_idx)
+    hfrs, fwhms, roundnesses, trail, elong = detect_star_metrics(
+        flat, noise, h, w, saturated_idx, saturation=saturation)
     if trail is not None:
         trail["frame_h"], trail["frame_w"] = h, w
 
@@ -1469,18 +2112,22 @@ def process_file(path: Path, calib=None, solver=None):
         "filter": filt,
         "exposure": exposure,
         "calibration": calibration,
+        "calibration_warnings": warnings,
         "calibrated_path": calibrated_path,
-        "solved_ra": solved["ra"] if solved else None,
-        "solved_dec": solved["dec"] if solved else None,
-        "solved_rotation": solved.get("rotation") if solved else None,
-        "solved_scale_arcsec": solved.get("scale_arcsec") if solved else None,
-        "pointing_error_arcsec": solved.get("error_arcsec") if solved else None,
+        **solved_fields(None),
+        **header_pointing(header, w, h),
         "date_obs": str(header.get("DATE-LOC", header.get("DATE-OBS", ""))).strip(),
+        "settings": settings,
+        "full_scale_adu": full_scale,
+        "pixel_scale_arcsec": frame_pixel_scale(header),
         "adu_min": adu_min,
         "adu_max": adu_max,
         "adu_mean": adu_mean,
         "signal_adu": signal_adu,
         "signal_adu_per_sec": signal_adu_per_sec,
+        # What signal_adu was measured against when nothing was subtracted, so a backfill
+        # of an older row never mixes pedestals within one set.
+        "pedestal_adu": None if dark_ok else (pedestal if pedestal is not None else BIAS_ADU),
         "num_stars": len(hfrs),
         "hfr_avg": float(np.median(hfrs)) if hfrs else None,
         "fwhm_avg": float(np.median(fwhms)) if fwhms else None,
@@ -1494,30 +2141,130 @@ def process_file(path: Path, calib=None, solver=None):
         "elong_uniform_angle_deg": elong["uniform_angle_deg"] if elong else None,
         "elong_radial_r": elong["radial_r"] if elong else None,
         "elong_radial_diff_deg": elong["radial_diff_deg"] if elong else None,
+        # What an incremental rescan compares against (see build_dataset).
+        "source_stat": source_stat,
+        "scan_sig": signature,
     }
+    add_derived_adu_fields(row)
     row["quality_score"], row["quality_reasons"], row["quality_verdict"] = compute_quality(row)
     return row
 
 
-def process_file_safe(path: Path, calib=None, solver=None):
+def solved_fields(solved):
+    """The row fields a plate solve fills in, all None when it did not solve. The full
+    WCS only when the solve produced one: a frame's own header WCS is not overwritten
+    by nothing."""
+    solved = solved or {}
+    out = {"solved_ra": solved.get("ra"), "solved_dec": solved.get("dec"),
+           "solved_rotation": solved.get("rotation"),
+           "solved_scale_arcsec": solved.get("scale_arcsec"),
+           "pointing_error_arcsec": solved.get("error_arcsec")}
+    if solved.get("wcs"):
+        out["wcs"] = solved["wcs"]
+    return out
+
+
+def header_pointing(header, width, height):
+    """What the header says about where the frame points: its own WCS if the capture
+    software wrote one, the OBJECT name, and the mount's RA/Dec."""
+    return {"wcs": wcs_info(header, width, height, "header"),
+            "object": str(header.get("OBJECT", "")).strip() or None,
+            "mount_ra": _number(header.get("RA")), "mount_dec": _number(header.get("DEC"))}
+
+
+def first_image_header(path: Path):
+    """Header of the first image HDU, without reading any pixel data."""
+    with fits.open(str(path)) as hdul:
+        hdus: Any = hdul   # see first_image_hdu for why this is typed loosely
+        for hdu in hdus:
+            if int(hdu.header.get("NAXIS", 0)) >= 2:
+                return hdu.header.copy()
+    raise ValueError("file contains no image data")
+
+
+def solve_dataset(dataset, solver, workers=None, progress=True, redo=False):
+    """Plate solve the frames of a measured dataset, in place.
+
+    Solving only needs the file and its header, so it runs here, after measuring, rather
+    than inside every measurement worker: there one ASTAP per core - each of them
+    multithreaded itself - oversubscribed the machine several times over. Frames that
+    already carry a solution are skipped unless `redo`; frames no longer at their path
+    (moved to _deleted by the review server, say) are skipped and counted.
+    """
+    def wanted(r):
+        if "adu_mean" not in r or (r.get("solved_ra") is not None and not redo):
+            return False
+        # A frame ASTAP already failed on, unchanged since, fails again - and an unsolvable
+        # (cloudy, star-poor) frame can take the full timeout every time it is retried.
+        return redo or r.get("solve_failed") != r.get("source_stat")
+
+    rows = [r for entry in dataset for r in entry.get("files", []) if wanted(r)]
+    if not rows:
+        return {"solved": 0, "failed": 0, "missing": 0}
+
+    def solve_one(row):
+        path = Path(row["path"])
+        if not path.exists():
+            return "missing", None
+        try:
+            header = first_image_header(path)
+        except (OSError, ValueError):
+            return "failed", None
+        solved = solve_frame(solver, path, header, int(header["NAXIS2"]))
+        return ("solved" if solved else "failed"), solved
+
+    counts = {"solved": 0, "failed": 0, "missing": 0}
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=max(1, workers or ASTAP_CONCURRENCY)) as pool:
+        futures = {pool.submit(solve_one, r): r for r in rows}
+        for done, future in enumerate(as_completed(futures), 1):
+            row = futures[future]
+            outcome, solved = future.result()
+            counts[outcome] += 1
+            if outcome == "failed":
+                row["solve_failed"] = row.get("source_stat")
+            if solved:
+                row.pop("solve_failed", None)
+                row.update(solved_fields(solved))
+                if solver.get("update_header"):
+                    # --write-wcs rewrote the file; record its new identity, or the next
+                    # incremental scan would re-measure every frame it touched.
+                    try:
+                        row["source_stat"] = _stat_of(Path(row["path"]))
+                    except OSError:
+                        pass
+            if progress:
+                _report_progress(done, len(rows), t0, row.get("name", ""))
+    if progress:
+        print(f"\nplate solving: {counts['solved']} solved, {counts['failed']} failed "
+              f"(not retried until the frame changes, or --resolve), "
+              f"{counts['missing']} no longer on disk "
+              f"({sum(len(e.get('files', [])) for e in dataset) - len(rows)} skipped)",
+              file=sys.stderr)
+    return counts
+
+
+def process_file_safe(path: Path, calib=None, opts=None):
     """process_file, but a failure becomes an error row instead of aborting the run."""
     try:
-        return process_file(path, calib, solver)
+        return process_file(path, calib, opts)
     except Exception as e:
         return {"path": str(path), "name": path.name, "error": str(e) or repr(e)}
 
 
 def add_derived_adu_fields(row):
-    """Backfill derived signal fields for rows loaded from older JSON caches."""
+    """Backfill derived fields for rows loaded from older JSON caches, and the arcsec
+    figures, which depend on a plate solve that may have been added since the scan."""
     if "adu_mean" not in row:
         return row
-    row.setdefault("signal_adu", row["adu_mean"] - BIAS_ADU)
+    row.setdefault("signal_adu", row["adu_mean"] - (row.get("pedestal_adu") or BIAS_ADU))
     row.setdefault("has_trail", False)
     row.setdefault("elong_n", 0)
     row.setdefault("elong_uniform_r", None)
     row.setdefault("elong_uniform_angle_deg", None)
     row.setdefault("elong_radial_r", None)
     row.setdefault("elong_radial_diff_deg", None)
+    row.setdefault("calibration_warnings", [])
     exposure = row.get("exposure")
     if "signal_adu_per_sec" not in row:
         row["signal_adu_per_sec"] = (
@@ -1525,6 +2272,12 @@ def add_derived_adu_fields(row):
             if isinstance(exposure, (int, float)) and exposure > 0
             else None
         )
+    # A solved scale is measured; the optics cards are only what the header claims.
+    scale = row.get("solved_scale_arcsec") or row.get("pixel_scale_arcsec")
+    row["scale_arcsec"] = scale
+    for field in ("hfr", "fwhm"):
+        px = row.get(f"{field}_avg")
+        row[f"{field}_arcsec"] = px * scale if scale and isinstance(px, (int, float)) else None
     return row
 
 
@@ -1565,9 +2318,100 @@ def add_dataset_derived_fields(dataset):
     return dataset
 
 
+def _json_clean(obj):
+    """obj with every NaN/inf float replaced by None.
+
+    json.dumps writes them as the bare words NaN/Infinity, which Python and browsers
+    accept but strict readers (jq, most other languages) reject outright - a folder whose
+    frames all failed to read used to make the whole cache unreadable to them.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_clean(v) for v in obj]
+    if isinstance(obj, np.generic):
+        return _json_clean(obj.item())
+    return obj
+
+
+def write_json_atomic(path: Path, obj, indent=2):
+    """Write strict JSON via a temp file + rename, so an interrupted write - Ctrl+C, a
+    full disk - leaves the previous file intact instead of a truncated one."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(_json_clean(obj), indent=indent, allow_nan=False),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+
+
+_PROGRESS_LAST = [0.0]
+
+
 def _report_progress(done, total, t0, name):
     elapsed = time.time() - t0
-    print(f"\r[{done}/{total}] {elapsed:6.1f}s  {name[:60]:<60}", end="", file=sys.stderr)
+    if sys.stderr.isatty():
+        print(f"\r[{done}/{total}] {elapsed:6.1f}s  {name[:60]:<60}", end="", file=sys.stderr)
+        return
+    # Redirected to a log: a carriage-return line per frame is thousands of lines of
+    # noise there, so report every ~10 s and at the end instead.
+    if done == total or time.time() - _PROGRESS_LAST[0] >= 10.0:
+        _PROGRESS_LAST[0] = time.time()
+        print(f"[{done}/{total}] {elapsed:6.1f}s", file=sys.stderr)
+
+
+def _available_memory_bytes():
+    """Memory free for new work, or None where the platform will not say."""
+    try:
+        import psutil  # type: ignore[import-not-found]
+        return int(psutil.virtual_memory().available)
+    except ImportError:
+        pass
+    try:
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError, OSError):
+        pass
+    try:   # macOS has no SC_AVPHYS_PAGES; fall back to a share of physical memory
+        return int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.5)
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+def memory_capped_workers(requested, paths):
+    """`requested` workers (CPU count when None), but no more than memory can hold.
+
+    Each worker holds several full-frame float copies at its peak - the frame, the
+    flattened frame, the float64 convolution, the segmentation - about
+    WORKER_BYTES_PER_PIXEL per pixel. On a 60 Mpx sensor that is gigabytes a worker, and a
+    worker per core ran a 16-core machine out of memory. An explicit -w is honoured.
+    """
+    if requested is not None:
+        return requested
+    cpus = os.cpu_count() or 1
+    if not paths:
+        return cpus
+    try:
+        header = first_image_header(paths[0])
+        pixels = int(header["NAXIS1"]) * int(header["NAXIS2"])
+    except (OSError, ValueError, KeyError):
+        return cpus
+    available = _available_memory_bytes()
+    if not available:
+        return cpus
+    fit = max(1, int(available * 0.8 // (pixels * WORKER_BYTES_PER_PIXEL)))
+    if fit < cpus:
+        print(f"scan: {fit} worker(s) instead of {cpus} - each needs "
+              f"~{pixels * WORKER_BYTES_PER_PIXEL / 1e9:.1f} GB for these "
+              f"{pixels / 1e6:.0f} Mpx frames", file=sys.stderr)
+    return min(cpus, fit)
+
+
+def _ignore_sigint():
+    """Pool initializer: Ctrl+C is the parent's to handle. A worker that took it too died
+    mid-frame, broke the pool, and the parent fell back to finishing the scan serially."""
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 def _make_pool(workers):
@@ -1582,30 +2426,46 @@ def _make_pool(workers):
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
                 "VECLIB_MAXIMUM_THREADS"):
         os.environ.setdefault(var, "1")
-    return ProcessPoolExecutor(max_workers=workers)
+    return ProcessPoolExecutor(max_workers=workers, initializer=_ignore_sigint)
 
 
-def process_paths(paths, progress=True, workers=None, calib=None, solver=None):
+def process_paths(paths, progress=True, workers=None, calib=None, opts=None, on_result=None):
     """Measure every path, in input order. Frames are independent, so fan them out
-    across workers: the per-frame cost is numpy/photutils work on a ~9 Mpx array."""
+    across workers: the per-frame cost is numpy/photutils work on a ~9 Mpx array.
+
+    on_result(index, row) is called in the parent as each row arrives - build_dataset uses
+    it to checkpoint progress, so an interrupted scan does not start over.
+    """
     total = len(paths)
     t0 = time.time()
-    if workers is None:
-        workers = os.cpu_count() or 1
+    workers = memory_capped_workers(workers, paths)
     workers = max(1, min(workers, total)) if total else 1
 
     results: list[Any] = [None] * total   # rows land here as they come back, in input order
+
+    def land(i, row):
+        results[i] = row
+        if on_result:
+            on_result(i, row)
+
     if workers > 1:
+        pool = _make_pool(workers)
         try:
-            with _make_pool(workers) as pool:
-                pending = {pool.submit(process_file_safe, p, calib, solver): i for i, p in enumerate(paths)}
-                for done, future in enumerate(as_completed(pending), 1):
-                    i = pending[future]
-                    results[i] = future.result()
-                    if progress:
-                        _report_progress(done, total, t0, paths[i].name)
+            pending = {pool.submit(process_file_safe, p, calib, opts): i
+                       for i, p in enumerate(paths)}
+            for done, future in enumerate(as_completed(pending), 1):
+                i = pending[future]
+                land(i, future.result())
+                if progress:
+                    _report_progress(done, total, t0, paths[i].name)
+            pool.shutdown()
             return results
+        except KeyboardInterrupt:
+            # Not a `with` block: leaving one waits for every queued frame to finish.
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
         except Exception as e:  # pool unavailable / broken -> still produce a report
+            pool.shutdown(wait=False, cancel_futures=True)
             # Keep whatever already came back; re-measuring those frames serially can
             # cost minutes on a large run.
             print(f"\nparallel scan failed ({e}); finishing the rest serially", file=sys.stderr)
@@ -1614,23 +2474,120 @@ def process_paths(paths, progress=True, workers=None, calib=None, solver=None):
     for i, path in enumerate(paths):
         if results[i] is not None:
             continue
-        results[i] = process_file_safe(path, calib, solver)
+        land(i, process_file_safe(path, calib, opts))
         done += 1
         if progress:
             _report_progress(done, total, t0, path.name)
     return results
 
 
+def _reusable(prev, path: Path, calib, opts):
+    """True when a cached row would come out the same if `path` were measured again."""
+    if not prev or "adu_mean" not in prev or not prev.get("source_stat"):
+        return False
+    try:
+        if _stat_of(path) != list(prev["source_stat"]):
+            return False
+    except OSError:
+        return False
+    if calib and calib.get("calibrated_dir"):
+        # --save-calibrated asked for now: a row kept from a run without it has no
+        # calibrated copy on disk, and only measuring the frame writes one.
+        saved = prev.get("calibrated_path")
+        if not saved or not Path(saved).exists():
+            return False
+    plan = calibration_plan(calib, path, prev.get("exposure"), prev.get("filter"),
+                            prev.get("settings") or {})
+    return frame_signature(plan, opts) == prev.get("scan_sig")
+
+
+def load_previous_rows(*sources):
+    """{path: row} from earlier caches/checkpoints; later sources win."""
+    rows = {}
+    for source in sources:
+        if not source or not Path(source).exists():
+            continue
+        try:
+            data = json.loads(Path(source).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        entries = data.get("rows", []) if isinstance(data, dict) else \
+            [r for entry in data for r in entry.get("files", [])]
+        for row in entries:
+            if isinstance(row, dict) and row.get("path"):
+                rows[row["path"]] = row
+    return rows
+
+
 def build_dataset(root: Path, progress=True, workers=None, darks_dir=None, calibrate=True,
-                  calibrated_dir=None, solver=None):
+                  calibrated_dir=None, solver=None, full_scale=None, previous=None,
+                  checkpoint=None):
+    """Measure every LIGHT frame under root into the folder-grouped dataset.
+
+    previous: {path: row} from an earlier run. A frame whose file, masters and options are
+    unchanged keeps its row instead of being measured again (see _reusable), which turns a
+    rescan after adding one night into seconds. checkpoint: a path that measured rows are
+    flushed to every CHECKPOINT_INTERVAL_S, so Ctrl+C - or a crash - loses at most that
+    much; the next run picks them up through `previous`.
+    """
     scanned = scan_light_dirs(root, exclude=[calibrated_dir] if calibrated_dir else ())
     paths = [p for files in scanned.values() for p in files]
     # Masters are built here, in the parent, so the workers only memory-map them.
     calib = (prepare_calibration(root, darks_dir, progress=progress,
                                  calibrated_dir=calibrated_dir) if calibrate else None)
-    rows_flat = process_paths(paths, progress=progress, workers=workers, calib=calib,
-                              solver=solver)
-    if progress:
+    # The pedestal behind any frame that ends up without a dark or bias subtracted: the
+    # master bias' own level where there is one (even under --no-calibrate), else BIAS_ADU.
+    opts = {"pedestal": calib.get("bias_level") if calib else master_bias_level(darks_dir),
+            "full_scale": full_scale}
+
+    previous = previous or {}
+    rows_flat: list[Any] = [None] * len(paths)
+    todo = []
+    for i, path in enumerate(paths):
+        prev = previous.get(str(path))
+        if _reusable(prev, path, calib, opts):
+            if "wcs" not in prev:
+                # Rows from before the WCS export: the header alone has it, so there is
+                # no reason to re-measure the frame for it.
+                try:
+                    header = first_image_header(path)
+                    prev.update({k: v for k, v in header_pointing(
+                        header, int(header["NAXIS1"]), int(header["NAXIS2"])).items()
+                        if k not in prev or k == "wcs"})
+                except (OSError, ValueError, KeyError):
+                    prev["wcs"] = None
+            rows_flat[i] = prev
+        else:
+            todo.append(i)
+    if progress and previous:
+        print(f"scan: {len(paths) - len(todo)} frame(s) unchanged since the last scan, "
+              f"{len(todo)} to measure", file=sys.stderr)
+
+    last_flush = [time.time()]
+
+    def flush():
+        if checkpoint:
+            write_json_atomic(checkpoint, {"rows": [r for r in rows_flat if r is not None]},
+                              indent=None)
+        last_flush[0] = time.time()
+
+    def on_result(j, row):
+        rows_flat[todo[j]] = row
+        if checkpoint and time.time() - last_flush[0] >= CHECKPOINT_INTERVAL_S:
+            flush()
+
+    try:
+        process_paths([paths[i] for i in todo], progress=progress, workers=workers,
+                      calib=calib, opts=opts, on_result=on_result)
+    except KeyboardInterrupt:
+        flush()
+        if progress:
+            done = sum(r is not None for r in rows_flat)
+            print(f"\ninterrupted: {done}/{len(paths)} frames kept"
+                  f"{' in ' + str(checkpoint) if checkpoint else ''}; "
+                  f"run the same command again to continue", file=sys.stderr)
+        raise
+    if progress and todo:
         print(file=sys.stderr)
 
     dataset = []
@@ -1641,7 +2598,7 @@ def build_dataset(root: Path, progress=True, workers=None, darks_dir=None, calib
 
         measured = [r for r in rows if "adu_mean" in r]
         means = [r["adu_mean"] for r in measured]
-        folder_mean = float(np.mean(means)) if means else float("nan")
+        folder_mean = float(np.mean(means)) if means else None
         for r in measured:
             add_derived_adu_fields(r)
         # Deviation is measured against frames of the same exposure length, not against
@@ -1659,6 +2616,12 @@ def build_dataset(root: Path, progress=True, workers=None, darks_dir=None, calib
             "folder_mean_adu": folder_mean,
             "files": rows,
         })
+    if solver:
+        solve_dataset(dataset, solver, progress=progress)
+    warned = sum(1 for r in rows_flat if r and r.get("calibration_warnings"))
+    if progress and warned:
+        print(f"calibration: {warned} frame(s) carry calibration warnings "
+              f"(shown in the Cal column's tooltip)", file=sys.stderr)
     return add_dataset_derived_fields(dataset)
 
 
@@ -1708,8 +2671,11 @@ def filter_tint_css(filt):
 
 
 def natural_num(s):
-    m = re.search(r"(\d+)", s)
-    return int(m.group(1)) if m else 0
+    """Natural sort key: "Panel 2" before "Panel 10", and names that share a leading number
+    ("2024-10-03", "2024-11-12") or carry none at all still order by the rest of the name
+    rather than tying and falling back to whatever order they were collected in."""
+    return [(0, int(chunk), "") if chunk.isdigit() else (1, 0, chunk.lower())
+            for chunk in re.findall(r"\d+|\D+", s)]
 
 
 def filter_sort_key(f):
@@ -1739,12 +2705,30 @@ def exposure_label(key):
     return f"{key}s" if key else "no exposure"
 
 
+ROOT_LABEL = "(root)"   # the session/panel of a tree scanned from below that level
+
+
 def parse_folder(folder_str):
-    """Split a "session/panel/filter/LIGHT" folder path into (session, panel, filter), or None."""
-    parts = folder_str.replace("\\", "/").split("/")
-    if len(parts) != 4 or parts[3].upper() != "LIGHT":
+    """Split a LIGHT folder path, relative to the scan root, into (session, panel, filter).
+
+    The canonical layout is session/panel/filter/LIGHT, but a root one level deeper (a
+    single session) or shallower (a year folder above the sessions) is just as common, and
+    used to drop every frame into an ungrouped leftovers list with no matrix entry and no
+    relative metrics. The two folders above LIGHT are always panel and filter; whatever
+    sits above those is the session (joined, if several levels), or ROOT_LABEL when the
+    root itself is the session or panel. None only for a LIGHT folder at the very root.
+    """
+    parts = [p for p in folder_str.replace("\\", "/").split("/") if p and p != "."]
+    if not parts or parts[-1].upper() != "LIGHT":
         return None
-    return parts[0], parts[1], parts[2]
+    n = len(parts) - 1
+    if n >= 3:
+        return "/".join(parts[:n - 2]), parts[n - 2], parts[n - 1]
+    if n == 2:
+        return ROOT_LABEL, parts[0], parts[1]
+    if n == 1:
+        return ROOT_LABEL, ROOT_LABEL, parts[0]
+    return None
 
 
 def group_by_panel(entries, folder_of):
@@ -1919,85 +2903,23 @@ MATRIX_TOTAL_COLUMNS = [
     ("exposure", "Total exposure"),
 ]
 
+# The pages' JavaScript and CSS live in static/ as ordinary files, so they can be linted and
+# edited as what they are; both the report and the review page inline them, which keeps
+# the report a single self-contained HTML file.
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+def static_text(name):
+    return (STATIC_DIR / name).read_text(encoding="utf-8")
+
+
 # Shared by the static report and the review server so the two can never disagree about
 # what a row total says.
-MATRIX_TOTALS_JS = """
-function splitExposure(minutes) {
-  if (minutes === null || minutes === undefined || Number.isNaN(minutes)) return null;
-  let h = Math.floor(minutes / 60);
-  let m = Math.round(minutes - h * 60);
-  // A value like 119.7 min rounds to 60 on the minute part; carry it rather than show "1h 60m".
-  if (m === 60) { h += 1; m = 0; }
-  return {h: h, m: m};
-}
+MATRIX_TOTALS_JS = static_text("matrix_totals.js")
 
-function fmtTotalExposure(minutes) {
-  const t = splitExposure(minutes);
-  if (!t) return '\\u2014';
-  return t.h ? t.h + 'h ' + t.m + 'm' : t.m + 'm';
-}
+MATRIX_CSS = static_text("matrix.css")
 
-// "20m" and "1h 9m" right-aligned as one string still do not line up, because they are a
-// different number of tokens. Each part gets its own fixed-width slot instead, so the
-// minutes share an edge down the column whether or not there is an hour beside them.
-function setRowTotal(cell, kind, frames, minutes, any) {
-  cell.replaceChildren();
-  if (!any) { cell.textContent = '\\u2014'; return; }
-  if (kind === 'frames') { cell.textContent = String(frames); return; }
-  const t = splitExposure(minutes);
-  if (!t) { cell.textContent = '\\u2014'; return; }
-  const hours = document.createElement('span');
-  hours.className = 'exp-h';
-  hours.textContent = t.h ? t.h + 'h' : '';
-  const mins = document.createElement('span');
-  mins.className = 'exp-m';
-  mins.textContent = t.m + 'm';
-  cell.append(hours, mins);
-}
-
-function rowTotalKey(kind, frames, minutes, any) {
-  return !any ? '-' : (kind === 'frames' ? String(frames) : fmtTotalExposure(minutes));
-}
-"""
-
-MATRIX_CSS = """
-.matrix-wrap { overflow-x:auto; margin-bottom:8px; }
-table.matrix { border-collapse:collapse; width:100%; background:var(--panel); border:1px solid var(--border); border-radius:8px; }
-table.matrix th, table.matrix td { padding:8px 12px; border-bottom:1px solid var(--border); border-right:1px solid var(--border); vertical-align:top; }
-table.matrix th { background:var(--head); color:var(--muted); font-weight:600; text-align:center; }
-table.matrix tbody tr { background:var(--filter-tint); }
-table.matrix th:first-child,
-table.matrix th:nth-child(2),
-table.matrix td.matrix-panel,
-table.matrix td.matrix-filter { text-align:left; font-weight:600; color:var(--text); }
-table.matrix td.matrix-cell { text-align:right; }
-table.matrix tbody td.matrix-panel { background:var(--head); }
-table.matrix tbody td.matrix-filter { background:rgba(255,255,255,0.035); }
-table.matrix .empty { color:var(--muted); }
-/* Row totals: the same row read across every session, so they sit past a heavier rule
-   that marks where the per-session columns stop. */
-table.matrix th.matrix-total, table.matrix td.matrix-total { text-align:right; }
-table.matrix th.total-first, table.matrix td.total-first { border-left:2px solid var(--border); }
-table.matrix td.matrix-total { font-weight:600; color:var(--text); font-variant-numeric:tabular-nums; }
-.exp-h { display:inline-block; min-width:2.2em; text-align:right; }
-.exp-m { display:inline-block; min-width:2.9em; text-align:right; }
-.metric-btn { font:inherit; font-size:12px; padding:5px 11px; border-radius:999px; border:1px solid var(--border); background:var(--panel); color:var(--muted); cursor:pointer; }
-.metric-btn:hover { border-color:var(--accent); color:var(--text); }
-.metric-btn.active { background:var(--accent); border-color:var(--accent); color:#0b0d12; font-weight:600; }
-.cell-line { display:flex; align-items:center; gap:6px; font-size:12px; white-space:nowrap; }
-.swatch { width:9px; height:9px; border-radius:50%; flex:none; }
-.row-exp { color:var(--muted); font-weight:400; font-size:11px; }
-/* The filter letter and the exposure label are both variable width ("R 30s" vs "H 180s"),
-   which pushed the buttons after them to a different x on every row. Fixed slots keep the
-   whole column of buttons on one left edge. */
-.row-filter { display:inline-block; min-width:0.9em; }
-.row-exp-fixed { display:inline-block; min-width:2.9em; text-align:right; font-variant-numeric:tabular-nums; }
-.cell-val { font-variant-numeric: tabular-nums; }
-"""
-
-COMPARISON_CSS = MATRIX_CSS + """
-.metric-row { display:flex; flex-wrap:wrap; gap:6px; margin:10px 0 16px; }
-"""
+COMPARISON_CSS = MATRIX_CSS + static_text("report.css")
 
 
 def render_metric_buttons(parts):
@@ -2064,7 +2986,7 @@ def render_matrix_skeleton(parts, panels, sessions, rows, row_extra=None):
 def json_for_script(obj):
     """json.dumps safe to embed in an inline <script>: a "</script>" inside a string
     would otherwise terminate the block early."""
-    return json.dumps(obj).replace("</", "<\\/")
+    return json.dumps(_json_clean(obj)).replace("</", "<\\/")
 
 
 def build_comparison_section(dataset):
@@ -2078,54 +3000,10 @@ def build_comparison_section(dataset):
     render_metric_buttons(parts)
     render_matrix_skeleton(parts, panels, sessions, rows)
 
-    parts.append(f"""<script>{MATRIX_TOTALS_JS}
-const COMP = {json_for_script(comp)};
-const COMP_METRICS = {json_for_script(COMPARISON_METRICS)};
-let matrixMetric = COMP_METRICS[0][0];
-
-function fmtMetric(v, digits, pct) {{
-  if (v === null || v === undefined || Number.isNaN(v)) return '&mdash;';
-  const opts = {{minimumFractionDigits: digits, maximumFractionDigits: digits}};
-  return pct ? (v * 100).toLocaleString(undefined, opts) + '%' : Number(v).toLocaleString(undefined, opts);
-}}
-
-function renderMatrix() {{
-  const [, , digits, pct] = COMP_METRICS.find(m => m[0] === matrixMetric) || COMP_METRICS[0];
-  document.querySelectorAll('.matrix-cell').forEach(cell => {{
-    const byFilter = (COMP[cell.dataset.panel] || {{}})[cell.dataset.session] || {{}};
-    const agg = (byFilter[cell.dataset.filter] || {{}})[cell.dataset.exposure];
-    cell.innerHTML = agg
-      ? '<span class="cell-val">' + fmtMetric(agg[matrixMetric], digits, pct) + '</span>'
-      : '<span class="empty">&mdash;</span>';
-  }});
-  renderMatrixTotals();
-}}
-
-function renderMatrixTotals() {{
-  // One row is one panel+filter at one exposure; the total is that row read across
-  // every session column.
-  document.querySelectorAll('.matrix-total[data-total]').forEach(cell => {{
-    const bySession = COMP[cell.dataset.panel] || {{}};
-    let frames = 0, minutes = 0, any = false;
-    for (const session of Object.keys(bySession)) {{
-      const agg = ((bySession[session] || {{}})[cell.dataset.filter] || {{}})[cell.dataset.exposure];
-      if (!agg) continue;
-      any = true;
-      if (typeof agg.frames === 'number') frames += agg.frames;
-      if (typeof agg.total_exp_min === 'number') minutes += agg.total_exp_min;
-    }}
-    setRowTotal(cell, cell.dataset.total, frames, minutes, any);
-  }});
-}}
-
-function setMatrixMetric(key) {{
-  matrixMetric = key;
-  document.querySelectorAll('.metric-btn').forEach(b => b.classList.toggle('active', b.dataset.metric === key));
-  renderMatrix();
-}}
-
-renderMatrix();
-</script>""")
+    parts.append("<script>" + MATRIX_TOTALS_JS
+                 + "\nconst COMP = " + json_for_script(comp) + ";\n"
+                 + "const COMP_METRICS = " + json_for_script(COMPARISON_METRICS) + ";\n"
+                 + static_text("comparison.js") + "</script>")
 
     return "\n".join(parts)
 
@@ -2148,7 +3026,8 @@ def fmt_elongation(r):
 
 
 CALIBRATION_HINT = {
-    "Cal": "Calibration applied: D = master dark, B = master bias, F = master flat",
+    "Cal": ("Calibration applied: D = master dark, B = master bias, F = master flat. "
+            "! = a master was skipped or is a poor match; hover the cell for why"),
     "ADU min": "As recorded by the sensor, before calibration",
     "ADU max": "As recorded by the sensor, before calibration - 65535 means a star hit the ceiling",
     "ADU mean": "As recorded by the sensor, before calibration",
@@ -2175,6 +3054,26 @@ def fmt_quality(r):
     return f'<td class="q-{html.escape(verdict or "", quote=True)}" title="{title}">{score:.0f}</td>'
 
 
+def _calibration_cell(r):
+    """The Cal cell: the D/B/F tag, with what was applied - and any master that was
+    skipped for not matching the frame - in its tooltip, flagged with a "!"."""
+    warnings = r.get("calibration_warnings") or []
+    title = str(r.get("calibration") or "not calibrated")
+    if warnings:
+        title += "\n" + "\n".join(f"! {w}" for w in warnings)
+    tag = fmt_calibration(r) or EM_DASH
+    flag = ' <span class="cal-warn">!</span>' if warnings else ""
+    return f'<td class="cal-tag" title="{html.escape(title, quote=True)}">{tag}{flag}</td>'
+
+
+def _arcsec_cell(r, field):
+    """An HFR/FWHM cell in pixels, with the angular size in the tooltip when known."""
+    px, arcsec = r.get(f"{field}_avg"), r.get(f"{field}_arcsec")
+    title = f' title="{arcsec:.2f}&quot; at {r["scale_arcsec"]:.2f}&quot;/px"' \
+        if isinstance(arcsec, (int, float)) and r.get("scale_arcsec") else ""
+    return f"<td{title}>{fmt(px, 2)}</td>"
+
+
 def render_row_cells(r):
     """The <td> cells for one frame, in TABLE_HEADERS order. Shared with the review server
     so the static report and the live table can never drift apart."""
@@ -2196,16 +3095,15 @@ def render_row_cells(r):
         f'<td>{html.escape(r.get("filter") or "") or EM_DASH}</td>',
         fmt_quality(r),
         f'<td>{exp_str}</td>',
-        (f'<td class="cal-tag" title="{html.escape(str(r.get("calibration") or "not calibrated"), quote=True)}">'
-         f'{fmt_calibration(r) or EM_DASH}</td>'),
+        _calibration_cell(r),
         f'<td>{fmt(r.get("adu_min"), 0)}</td>',
         f'<td>{fmt(r.get("adu_max"), 0)}</td>',
         f'<td>{fmt(r.get("adu_mean"), 1)}</td>',
         f'<td>{fmt(r.get("signal_adu"), 1)}</td>',
         f'<td>{fmt(r.get("signal_adu_per_sec"), 2)}</td>',
         f'<td class="dev-cell {dev_cls}">{dev_str}</td>',
-        f'<td>{fmt(r.get("hfr_avg"), 2)}</td>',
-        f'<td>{fmt(r.get("fwhm_avg"), 2)}</td>',
+        _arcsec_cell(r, "hfr"),
+        _arcsec_cell(r, "fwhm"),
         f'<td>{int(r.get("num_stars") or 0)}</td>',
         f'<td>{fmt_pct(r.get("roundness_avg"), 1)}</td>',
         f'<td>{html.escape(fmt_elongation(r))}</td>',
@@ -2276,107 +3174,9 @@ def render_sessions_table(sess_list):
     return parts
 
 
-BASE_CSS = """
-:root {
-  --bg: #0b0d12; --panel:#12151c; --border:#232837; --text:#e6e9f0; --muted:#8a93a6;
-  --accent:#5aa9ff; --good:#3ecf8e; --bad:#ff6b6b; --head:#1a1f2b;
-}
-@media (prefers-color-scheme: light) {
-  :root { --bg:#f7f8fa; --panel:#ffffff; --border:#e2e5ea; --text:#1b1e26; --muted:#5b6472;
-           --accent:#1868c9; --good:#0e8f5b; --bad:#c62828; --head:#eef1f6; }
-}
-* { box-sizing: border-box; }
-body { background:var(--bg); color:var(--text); font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; margin:0; }
-h1 { font-size:20px; margin:0 0 4px; }
-.sub { color:var(--muted); font-size:13px; margin-bottom:24px; }
-h2 { font-size:17px; margin:36px 0 4px; color:var(--accent); font-weight:700; }
-h3 { font-size:14px; margin:20px 0 6px; color:var(--text); font-weight:600; opacity:0.85; }
-h4 { font-size:12.5px; margin:14px 0 6px; color:var(--muted); font-weight:600; }
-.meta { color:var(--muted); font-size:12px; margin-bottom:10px; }
-table { border-collapse:collapse; width:100%; font-size:12.5px; background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
-th, td { padding:6px 10px; text-align:right; border-bottom:1px solid var(--border); white-space:nowrap; }
-th:first-child, td:first-child { text-align:left; }
-th { background:var(--head); color:var(--muted); font-weight:600; position:sticky; top:0; }
-tbody tr:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
-.dev-pos { color: var(--bad); }
-.dev-neg { color: var(--good); }
-.q-good { color: var(--good); font-weight:600; }
-.q-warn { color: #d9a441; font-weight:600; }
-.q-reject { color: var(--bad); font-weight:600; }
-.cal-tag { color: var(--muted); font-size:11px; letter-spacing:0.03em; }
-.wrap { overflow-x:auto; border-radius:8px; }
-.err { color:var(--bad); font-style:italic; text-align:left; }
-th.sortable { cursor:pointer; user-select:none; }
-th.sortable:hover { color:var(--text); }
-th.sortable::after { content:''; display:inline-block; width:0.7em; margin-left:3px; opacity:0.4; }
-th.sort-asc::after { content:'\\2191'; opacity:1; }
-th.sort-desc::after { content:'\\2193'; opacity:1; }
-"""
+BASE_CSS = static_text("base.css")
 
-SORT_TABLE_JS = """
-(function () {
-  // An em-dash is how every formatter here writes "no value", so it is missing data
-  // rather than text. Counting it as text made any metric column with one unmeasured
-  // frame sort as strings, putting "11.40" above "2.05" in HFR, ADU, quality and the
-  // rest. Blank cells were already treated this way; the dash just never was.
-  var MISSING = /^[\\s\\u2013\\u2014-]*$/;
-
-  function cellSortValue(td) {
-    var raw = td.textContent.trim();
-    if (MISSING.test(raw)) return { raw: raw, num: null, missing: true };
-    var num = parseFloat(raw.replace(/[^0-9.\\-]+/g, ''));
-    return { raw: raw, num: isNaN(num) ? null : num, missing: false };
-  }
-
-  function columnIsNumeric(rows, idx) {
-    var seen = 0, numeric = 0;
-    for (var i = 0; i < rows.length; i++) {
-      var cell = rows[i].cells[idx];
-      if (!cell) continue;
-      var v = cellSortValue(cell);
-      if (v.missing) continue;
-      seen++;
-      if (v.num !== null) numeric++;
-    }
-    return seen > 0 && numeric === seen;
-  }
-
-  function sortTable(table, th) {
-    var idx = th.cellIndex;
-    var tbody = table.tBodies[0];
-    var rows = Array.prototype.slice.call(tbody.rows);
-    var errorRows = rows.filter(function (r) { return r.cells.length <= idx || r.querySelector('.err'); });
-    var dataRows = rows.filter(function (r) { return errorRows.indexOf(r) === -1; });
-
-    var asc = th.classList.contains('sort-asc') ? false : true;
-    Array.prototype.forEach.call(table.querySelectorAll('th.sortable'), function (h) {
-      h.classList.remove('sort-asc', 'sort-desc');
-    });
-    th.classList.add(asc ? 'sort-asc' : 'sort-desc');
-
-    var numeric = columnIsNumeric(dataRows, idx);
-    dataRows.sort(function (a, b) {
-      var av = cellSortValue(a.cells[idx]);
-      var bv = cellSortValue(b.cells[idx]);
-      var cmp;
-      if (numeric) {
-        cmp = (av.num === null ? -Infinity : av.num) - (bv.num === null ? -Infinity : bv.num);
-      } else {
-        cmp = av.raw.localeCompare(bv.raw);
-      }
-      return asc ? cmp : -cmp;
-    });
-
-    dataRows.concat(errorRows).forEach(function (r) { tbody.appendChild(r); });
-  }
-
-  document.querySelectorAll('table.sortable-table').forEach(function (table) {
-    table.querySelectorAll('th.sortable').forEach(function (th) {
-      th.addEventListener('click', function () { sortTable(table, th); });
-    });
-  });
-})();
-"""
+SORT_TABLE_JS = static_text("sort_table.js")
 
 
 def build_html(dataset, root_name):
@@ -2419,20 +3219,37 @@ def main():
     ap.add_argument("-o", "--output", default="fits_light_report.html", help="Output HTML file")
     ap.add_argument("-j", "--json-cache", default=None, help="Optional path to dump/read raw results as JSON")
     ap.add_argument("-w", "--workers", type=int, default=None,
-                    help="Parallel worker processes (default: CPU count, 1 = serial)")
+                    help="Parallel worker processes (default: CPU count, capped by free memory; "
+                         "1 = serial)")
     ap.add_argument("--rescan", action="store_true",
-                    help="Re-measure every frame even if the JSON cache already exists")
+                    help="Scan again even though the JSON cache exists. Frames whose file, "
+                         "masters and options are unchanged keep their cached measurements")
+    ap.add_argument("--full-rescan", action="store_true",
+                    help="Like --rescan, but re-measure every frame")
     ap.add_argument("--darks", default=None, metavar="DIR",
                     help="Folder of PixInsight master bias/dark XISF files. Darks are matched "
-                         "on exact exposure; the bias is used when no dark matches.")
+                         "on exact exposure (and gain/offset/binning where known); the "
+                         "matching bias is used when no dark matches.")
     ap.add_argument("--no-calibrate", action="store_true",
                     help="Measure the raw frames, ignoring master darks and any FLAT folders")
+    ap.add_argument("--full-scale", type=float, default=None, metavar="ADU",
+                    help="The sensor's full-scale ADU (default: the SATURATE card, else 65535). "
+                         "Set e.g. 4095 or 16383 for 12/14-bit data that is not scaled to 16 bit")
     ap.add_argument("--solve", action="store_true",
                     help="Plate solve every frame with ASTAP and record RA/Dec, rotation, "
                          "pixel scale and how far the mount's own pointing was off")
     ap.add_argument("--write-wcs", action="store_true",
                     help="With --solve, also write the WCS into each frame's own FITS header "
-                         "(appends cards in place; pixel data is untouched)")
+                         "(pixel data is untouched; the original header is kept in "
+                         f"<root>/{WCS_BACKUP_DIRNAME} for --undo-wcs)")
+    ap.add_argument("--undo-wcs", action="store_true",
+                    help="Put back every original header saved by --write-wcs, then exit")
+    ap.add_argument("--solve-only", action="store_true",
+                    help="Plate solve the frames already in the JSON cache (-j) and add the "
+                         "results to it, without re-measuring anything. Frames that already "
+                         "have a solution are skipped unless --resolve is given")
+    ap.add_argument("--resolve", action="store_true",
+                    help="With --solve-only, solve frames that already have a solution again")
     ap.add_argument("--astap", default=None, metavar="PATH",
                     help="Path to the ASTAP binary, if it is not in a standard location")
     ap.add_argument("--astap-db", default=None, metavar="DIR",
@@ -2445,8 +3262,31 @@ def main():
 
     root = Path(args.root).resolve()
     cache = Path(args.json_cache) if args.json_cache else None
+    if args.undo_wcs:
+        undo_wcs(root, cache)
+        return
+    rescan = args.rescan or args.full_rescan
 
-    if cache and cache.exists() and not args.rescan:
+    if args.solve_only:
+        if not cache or not cache.exists():
+            sys.exit("--solve-only needs an existing JSON cache (-j); run a scan first")
+        dataset = json.loads(cache.read_text(encoding="utf-8"))
+        solver = prepare_solver(args.astap, args.astap_db, update_header=args.write_wcs,
+                                root=root)
+        if solver is None:
+            sys.exit("--solve-only: ASTAP not found (pass --astap PATH)")
+        solve_dataset(dataset, solver, workers=args.workers, redo=args.resolve)
+        dataset = add_dataset_derived_fields(dataset)
+        write_json_atomic(cache, dataset)
+    elif cache and cache.exists() and not rescan:
+        print(f"Using cached measurements from {cache} (pass --rescan to pick up new or "
+              f"changed frames)", file=sys.stderr)
+        if args.solve or args.write_wcs or args.save_calibrated:
+            # These only act while frames are being measured; quietly dropping them left
+            # e.g. --solve looking like it ran and simply found nothing. (--darks is left
+            # out: run_light_stats.sh always passes it.)
+            print("  note: --solve/--write-wcs/--save-calibrated have no effect without "
+                  "--rescan (or use --solve-only)", file=sys.stderr)
         dataset = add_dataset_derived_fields(json.loads(cache.read_text(encoding="utf-8")))
     else:
         calibrated_dir = None
@@ -2456,12 +3296,23 @@ def main():
                 calibrated_dir = root / calibrated_dir
         solver = None
         if args.solve or args.write_wcs:
-            solver = prepare_solver(args.astap, args.astap_db, update_header=args.write_wcs)
-        dataset = build_dataset(root, workers=args.workers, darks_dir=args.darks,
-                                calibrate=not args.no_calibrate,
-                                calibrated_dir=calibrated_dir, solver=solver)
+            solver = prepare_solver(args.astap, args.astap_db, update_header=args.write_wcs,
+                                    root=root)
+        # Rows measured so far by an interrupted run, kept next to the cache.
+        checkpoint = (cache.with_name(cache.name + ".partial") if cache
+                      else root / ".fits_light_stats.partial.json")
+        previous = {} if args.full_rescan else load_previous_rows(cache, checkpoint)
+        try:
+            dataset = build_dataset(root, workers=args.workers, darks_dir=args.darks,
+                                    calibrate=not args.no_calibrate,
+                                    calibrated_dir=calibrated_dir, solver=solver,
+                                    full_scale=args.full_scale, previous=previous,
+                                    checkpoint=checkpoint)
+        except KeyboardInterrupt:
+            sys.exit(130)
         if cache:
-            cache.write_text(json.dumps(dataset, indent=2), encoding="utf-8")
+            write_json_atomic(cache, dataset)
+        checkpoint.unlink(missing_ok=True)
 
     # The report carries em dashes, sigmas and filter glyphs, so never leave the
     # encoding up to the platform default.

@@ -22,7 +22,9 @@ Usage:
     python3 organize_flats.py [root] [--apply] [--undo LOG]
 """
 import argparse
+import errno
 import os
+import shutil
 import sys
 import time
 from collections import defaultdict
@@ -72,12 +74,30 @@ def exposure_folder(exptime):
     return f"EXP_{float(exptime):.2f}"
 
 
+def exposure_seconds(header):
+    """EXPTIME (or EXPOSURE) as a float, or None when it is missing or not a number.
+
+    Checked once here: a non-numeric card used to get as far as exposure_folder() or
+    describe_set() and abort the whole run, dry run included, with a traceback.
+    """
+    value = header.get("EXPTIME", header.get("EXPOSURE"))
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def settings_folder(header):
     gain = header.get("GAIN")
     xb, yb = header.get("XBINNING"), header.get("YBINNING")
     if gain is None or xb is None:
         return None
-    return f"GAIN{int(round(float(gain)))}_BIN{int(xb)}x{int(yb or xb)}"
+    try:
+        return f"GAIN{int(round(float(gain)))}_BIN{int(xb)}x{int(yb or xb)}"
+    except (TypeError, ValueError):
+        return None     # a card that is not a number: file without the settings level
 
 
 def scan_session(session: Path):
@@ -116,7 +136,7 @@ def scan_session(session: Path):
                 continue
             flats.append({"path": path, "rel": rel + (name,),
                           "filter": str(header.get("FILTER", "")).strip(),
-                          "exptime": header.get("EXPTIME", header.get("EXPOSURE")),
+                          "exptime": exposure_seconds(header),
                           "settings": settings_folder(header)})
     return flats, light_filters, problems
 
@@ -134,7 +154,7 @@ def plan_session(session: Path, flats):
             problems.append(f"no FILTER in header, left in place: {f['path']}")
             continue
         if f["exptime"] is None:
-            problems.append(f"no EXPTIME in header, left in place: {f['path']}")
+            problems.append(f"no usable EXPTIME in header, left in place: {f['path']}")
             continue
         dst = session / group / f["filter"] / FLAT_DIR_NAME
         if f["settings"]:
@@ -182,13 +202,30 @@ def remove_empty_dirs(start: Path, stop: Path):
         d = d.parent
 
 
+def move_file(src: Path, dst: Path):
+    """Move one file without ever overwriting another.
+
+    A rename where possible - instant, and nothing is copied - and a copy-then-delete when
+    source and destination are on different drives, where rename refuses (EXDEV). The
+    explicit existence check matters on macOS/Linux, where rename replaces silently.
+    """
+    if dst.exists():
+        raise FileExistsError(f"destination already exists: {dst}")
+    try:
+        os.rename(src, dst)
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+        shutil.move(str(src), str(dst))
+
+
 def apply_moves(root: Path, moves):
     log = root / f"flat_moves_{time.strftime('%Y%m%d-%H%M%S')}.tsv"
     done = 0
     with log.open("a", encoding="utf-8") as out:
         for src, dst in moves:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            os.rename(src, dst)  # same volume, so this is instant and never copies
+            move_file(src, dst)
             out.write(f"{src}\t{dst}\n")
             out.flush()
             done += 1
@@ -208,7 +245,7 @@ def undo(root: Path, log: Path):
         sys.exit("undo aborted, nothing changed")
     for src, dst in reversed(lines):
         Path(src).parent.mkdir(parents=True, exist_ok=True)
-        os.rename(dst, src)
+        move_file(Path(dst), Path(src))
         remove_empty_dirs(Path(dst).parent, root)
     print(f"moved {len(lines)} flats back")
 
